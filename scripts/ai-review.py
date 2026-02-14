@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI Code Review using Google Gemini API with context caching support."""
+"""AI Code Review — supports Gemini and Claude APIs with switchable provider."""
 
 import os
 import sys
@@ -21,15 +21,14 @@ SKIP_DIRS = {
     '__pycache__', '.cache', '.github', 'vendor', '.vscode',
 }
 
-MAX_FILE_SIZE = 50_000      # 50 KB per file
-MAX_TOTAL_SIZE = 900_000    # ~900 KB total (fits well within 1M token window)
+MAX_FILE_SIZE = 50_000
+MAX_TOTAL_SIZE = 900_000
 
 # ---------------------------------------------------------------------------
 # File collection
 # ---------------------------------------------------------------------------
 
 def collect_files(project_dir):
-    """Recursively collect source files, respecting size limits."""
     files = {}
     total = 0
     for root, dirs, names in os.walk(project_dir):
@@ -77,33 +76,33 @@ Analyse the provided codebase and produce a structured report covering:
 
 Use **exactly** this output template:
 
-## \U0001f916 Еженедельный AI Code Review
+## 🤖 Еженедельный AI Code Review
 
 ### Overall Health Score: X/10
 
-### \U0001f4d0 SOLID: X/10
+### 📐 SOLID: X/10
 | Принцип | Оценка | Комментарий |
 |---------|--------|-------------|
-| SRP | \u2026 | \u2026 |
-| OCP | \u2026 | \u2026 |
-| LSP | \u2026 | \u2026 |
-| ISP | \u2026 | \u2026 |
-| DIP | \u2026 | \u2026 |
+| SRP | … | … |
+| OCP | … | … |
+| LSP | … | … |
+| ISP | … | … |
+| DIP | … | … |
 
-### \U0001f512 Безопасность: N проблем
-(список с \U0001f6a8 Critical / \u274c High / \u26a0\ufe0f Medium / \u2139\ufe0f Low)
+### 🔒 Безопасность: N проблем
+(список с 🚨 Critical / ❌ High / ⚠️ Medium / ℹ️ Low)
 
-### \u267b\ufe0f Рефакторинг: N возможностей
+### ♻️ Рефакторинг: N возможностей
 (список с приоритетом и рекомендуемым подходом)
 
-### \U0001f9ea Тестирование: N пробелов
+### 🧪 Тестирование: N пробелов
 (список)
 
-### \U0001f3d7\ufe0f Архитектура
+### 🏗️ Архитектура
 (ключевые наблюдения)
 
-### \U0001f4cb Приоритетный план действий
-1. \u2026
+### 📋 Приоритетный план действий
+1. …
 """
 
 SYSTEM_PR = """\
@@ -119,26 +118,26 @@ Focus on:
 
 Use **exactly** this output template:
 
-## \U0001f50d AI Review PR
+## 🔍 AI Review PR
 
 ### Резюме
 (1-2 предложения)
 
 ### Проблемы: N
-(список с \U0001f6a8/\u274c/\u26a0\ufe0f/\u2139\ufe0f)
+(список с 🚨/❌/⚠️/ℹ️)
 
 ### Предложения
 (конкретные улучшения)
 
-### Вердикт: \u2705 Approve / \u26a0\ufe0f Needs Changes / \U0001f6a8 Critical Issues
+### Вердикт: ✅ Approve / ⚠️ Needs Changes / 🚨 Critical Issues
 """
 
 # ---------------------------------------------------------------------------
-# Gemini API — SDK path (with context caching)
+# Gemini API
 # ---------------------------------------------------------------------------
 
-def review_sdk(code_context, mode, api_key, model):
-    """Use the google-genai SDK (supports explicit context caching)."""
+def review_gemini_sdk(code_context, mode, api_key, model):
+    """Google Gemini via google-genai SDK (with context caching)."""
     from google import genai
     from google.genai import types
 
@@ -150,7 +149,7 @@ def review_sdk(code_context, mode, api_key, model):
         max_output_tokens=8192,
     )
 
-    # --- Explicit context caching for large full reviews ---
+    # Explicit context caching for large full reviews
     if mode == 'full' and len(code_context) > 32_000:
         try:
             cache = client.caches.create(
@@ -168,7 +167,7 @@ def review_sdk(code_context, mode, api_key, model):
                     display_name="weekly-review-cache",
                 ),
             )
-            print(f"\u2713 Context cache created: {cache.name}", file=sys.stderr)
+            print(f"✓ Gemini context cache created: {cache.name}", file=sys.stderr)
 
             resp = client.models.generate_content(
                 model=model,
@@ -179,16 +178,14 @@ def review_sdk(code_context, mode, api_key, model):
                     max_output_tokens=8192,
                 ),
             )
-            # Cleanup
             try:
                 client.caches.delete(cache.name)
             except Exception:
                 pass
             return resp.text
         except Exception as exc:
-            print(f"\u26a0 Cache fallback: {exc}", file=sys.stderr)
+            print(f"⚠ Gemini cache fallback: {exc}", file=sys.stderr)
 
-    # --- Direct request (PR / small full / cache fallback) ---
     resp = client.models.generate_content(
         model=model,
         contents=[types.Content(
@@ -199,12 +196,9 @@ def review_sdk(code_context, mode, api_key, model):
     )
     return resp.text
 
-# ---------------------------------------------------------------------------
-# Gemini API — REST fallback
-# ---------------------------------------------------------------------------
 
-def review_rest(code_context, mode, api_key, model):
-    """Pure-stdlib REST fallback when SDK is unavailable."""
+def review_gemini_rest(code_context, mode, api_key, model):
+    """Gemini REST fallback when SDK is unavailable."""
     import urllib.request, urllib.error
 
     system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
@@ -226,28 +220,144 @@ def review_rest(code_context, mode, api_key, model):
     except urllib.error.HTTPError as exc:
         err = exc.read().decode()
         print(f"Gemini REST error {exc.code}: {err}", file=sys.stderr)
-        return f"\u274c AI Review failed: HTTP {exc.code}"
+        return f"❌ Gemini review failed: HTTP {exc.code}"
     except Exception as exc:
         print(f"Gemini REST error: {exc}", file=sys.stderr)
-        return f"\u274c AI Review failed: {exc}"
+        return f"❌ Gemini review failed: {exc}"
+
+# ---------------------------------------------------------------------------
+# Claude API
+# ---------------------------------------------------------------------------
+
+def review_claude_sdk(code_context, mode, api_key, model):
+    """Anthropic Claude via anthropic SDK."""
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
+
+    # Truncate if too large for Claude (200K context window)
+    if len(code_context) > 600_000:
+        code_context = code_context[:600_000] + "\n\n[... truncated due to size ...]"
+
+    print(f"→ Calling Claude {model} ({len(code_context)} chars)", file=sys.stderr)
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=8192,
+        temperature=0.2,
+        system=system,
+        messages=[
+            {"role": "user", "content": code_context + "\n\n---\nВыполни code review."}
+        ],
+    )
+
+    # Extract text from response
+    result = ""
+    for block in message.content:
+        if hasattr(block, 'text'):
+            result += block.text
+    return result
+
+
+def review_claude_rest(code_context, mode, api_key, model):
+    """Claude REST fallback when SDK is unavailable."""
+    import urllib.request, urllib.error
+
+    system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
+
+    if len(code_context) > 600_000:
+        code_context = code_context[:600_000] + "\n\n[... truncated due to size ...]"
+
+    url = "https://api.anthropic.com/v1/messages"
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 8192,
+        "temperature": 0.2,
+        "system": system,
+        "messages": [
+            {"role": "user", "content": code_context + "\n\n---\nВыполни code review."}
+        ],
+    }).encode()
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    req = urllib.request.Request(url, payload, headers)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            body = json.loads(r.read())
+            return "".join(b["text"] for b in body["content"] if b["type"] == "text")
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode()
+        print(f"Claude REST error {exc.code}: {err}", file=sys.stderr)
+        return f"❌ Claude review failed: HTTP {exc.code}"
+    except Exception as exc:
+        print(f"Claude REST error: {exc}", file=sys.stderr)
+        return f"❌ Claude review failed: {exc}"
+
+# ---------------------------------------------------------------------------
+# Provider dispatcher
+# ---------------------------------------------------------------------------
+
+PROVIDERS = {
+    "gemini": {
+        "sdk_fn": review_gemini_sdk,
+        "rest_fn": review_gemini_rest,
+        "sdk_import": "google.genai",
+        "sdk_package": "google-genai",
+        "env_key": "GEMINI_API_KEY",
+        "default_model": "gemini-2.5-flash",
+    },
+    "claude": {
+        "sdk_fn": review_claude_sdk,
+        "rest_fn": review_claude_rest,
+        "sdk_import": "anthropic",
+        "sdk_package": "anthropic",
+        "env_key": "ANTHROPIC_API_KEY",
+        "default_model": "claude-opus-4-20250514",
+    },
+}
+
+
+def run_review(code_context, mode, provider, api_key, model):
+    """Run review using the specified provider."""
+    p = PROVIDERS[provider]
+    if not model:
+        model = p["default_model"]
+
+    # Try SDK first, fall back to REST
+    try:
+        __import__(p["sdk_import"])
+        print(f"→ Using {provider} SDK ({model})", file=sys.stderr)
+        return p["sdk_fn"](code_context, mode, api_key, model)
+    except ImportError:
+        print(f"⚠ {p['sdk_package']} not installed, using REST API", file=sys.stderr)
+        return p["rest_fn"](code_context, mode, api_key, model)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="AI Code Review with Gemini")
+    ap = argparse.ArgumentParser(description="AI Code Review — Gemini / Claude")
     ap.add_argument("--mode", choices=["full", "pr"], default="full")
+    ap.add_argument("--provider", choices=["gemini", "claude"], default="gemini")
     ap.add_argument("--project-dir", default=".")
     ap.add_argument("--diff-file", default=None)
     ap.add_argument("--api-key", default=None)
-    ap.add_argument("--model", default="gemini-2.5-flash")
+    ap.add_argument("--model", default=None)
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
-    api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+    provider = args.provider
+    p = PROVIDERS[provider]
+
+    api_key = args.api_key or os.environ.get(p["env_key"])
     if not api_key:
-        sys.exit("Error: GEMINI_API_KEY not set")
+        sys.exit(f"Error: {p['env_key']} not set")
 
     # Build context
     if args.mode == "pr" and args.diff_file:
@@ -255,7 +365,7 @@ def main():
             context = f.read()
         if not context.strip():
             print("Empty diff, nothing to review.", file=sys.stderr)
-            report = "\u2705 Нет изменений для ревью."
+            report = "✅ Нет изменений для ревью."
             if args.output:
                 Path(args.output).write_text(report)
             else:
@@ -268,13 +378,8 @@ def main():
         context = build_code_context(files)
         print(f"Collected {len(files)} files for review", file=sys.stderr)
 
-    # Call Gemini
-    try:
-        from google import genai  # noqa: F401
-        report = review_sdk(context, args.mode, api_key, args.model)
-    except ImportError:
-        print("google-genai not installed, using REST API", file=sys.stderr)
-        report = review_rest(context, args.mode, api_key, args.model)
+    # Run review
+    report = run_review(context, args.mode, provider, api_key, args.model)
 
     # Output
     if args.output:
