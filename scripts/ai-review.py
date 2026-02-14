@@ -5,6 +5,7 @@
 import os
 import sys
 import json
+import time
 import argparse
 from pathlib import Path
 
@@ -23,8 +24,9 @@ SKIP_DIRS = {
 }
 
 MAX_FILE_SIZE = 50_000
-CHUNK_SIZE = 800_000       # ~800 KB per chunk → fits in context window
+CHUNK_SIZE = 600_000       # ~600 KB per chunk — safe for 250K token limit
 MAX_TOTAL_SIZE = 4_000_000 # 4 MB total limit across all chunks
+RATE_LIMIT_PAUSE = 25      # seconds between API calls to avoid 429
 
 # ---------------------------------------------------------------------------
 # File collection
@@ -214,7 +216,7 @@ Use **exactly** this output template:
 # ---------------------------------------------------------------------------
 
 def call_gemini(system, user_text, api_key, model):
-    """Single Gemini API call."""
+    """Single Gemini API call with retry on rate limit."""
     try:
         from google import genai
         from google.genai import types
@@ -225,21 +227,33 @@ def call_gemini(system, user_text, api_key, model):
             temperature=0.2,
             max_output_tokens=8192,
         )
-        resp = client.models.generate_content(
-            model=model,
-            contents=[types.Content(
-                role="user",
-                parts=[types.Part(text=user_text)],
-            )],
-            config=gen_cfg,
-        )
-        return resp.text
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=[types.Content(
+                        role="user",
+                        parts=[types.Part(text=user_text)],
+                    )],
+                    config=gen_cfg,
+                )
+                return resp.text
+            except Exception as exc:
+                if '429' in str(exc) and attempt < max_retries - 1:
+                    wait = RATE_LIMIT_PAUSE * (attempt + 1)
+                    print(f"  ⏳ Rate limited, waiting {wait}s (attempt {attempt+1}/{max_retries})...", file=sys.stderr)
+                    time.sleep(wait)
+                else:
+                    raise
+
     except ImportError:
         return call_gemini_rest(system, user_text, api_key, model)
 
 
 def call_gemini_rest(system, user_text, api_key, model):
-    """Gemini REST fallback."""
+    """Gemini REST fallback with retry."""
     import urllib.request, urllib.error
 
     url = (
@@ -252,17 +266,26 @@ def call_gemini_rest(system, user_text, api_key, model):
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
     }).encode()
 
-    req = urllib.request.Request(url, payload, {"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=300) as r:
-            body = json.loads(r.read())
-            return body["candidates"][0]["content"]["parts"][0]["text"]
-    except urllib.error.HTTPError as exc:
-        err = exc.read().decode()
-        print(f"Gemini REST error {exc.code}: {err}", file=sys.stderr)
-        return f"❌ Gemini review failed: HTTP {exc.code}"
-    except Exception as exc:
-        return f"❌ Gemini review failed: {exc}"
+    max_retries = 3
+    for attempt in range(max_retries):
+        req = urllib.request.Request(url, payload, {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                body = json.loads(r.read())
+                return body["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < max_retries - 1:
+                wait = RATE_LIMIT_PAUSE * (attempt + 1)
+                print(f"  ⏳ Rate limited, waiting {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                err = exc.read().decode()
+                print(f"Gemini REST error {exc.code}: {err}", file=sys.stderr)
+                return f"❌ Gemini review failed: HTTP {exc.code}"
+        except Exception as exc:
+            return f"❌ Gemini review failed: {exc}"
+
+    return "❌ Gemini review failed: max retries exceeded"
 
 # ---------------------------------------------------------------------------
 # Claude provider (Vertex AI)
@@ -375,8 +398,15 @@ def review_chunked(files, provider, model, **kwargs):
         partial_reviews.append(result)
         print(f"  ✓ Chunk {i}/{total} done ({len(result)} chars)", file=sys.stderr)
 
+        # Pause between chunks to respect rate limits
+        if i < total:
+            print(f"  ⏳ Waiting {RATE_LIMIT_PAUSE}s before next chunk (rate limit)...", file=sys.stderr)
+            time.sleep(RATE_LIMIT_PAUSE)
+
     # Merge all partial reviews
     print(f"→ Merging {total} partial reviews...", file=sys.stderr)
+    time.sleep(RATE_LIMIT_PAUSE)  # pause before merge call too
+
     merge_system = SYSTEM_MERGE.format(total_chunks=total)
     merge_input = "\n\n---\n\n".join(
         f"## Partial Review {i+1}/{total}\n\n{review}"
