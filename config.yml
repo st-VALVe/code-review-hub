@@ -4,27 +4,28 @@
 github_owner: "st-VALVe"
 
 # ┌─────────────────────────────────────────────┐
-# │  AI Provider — switch between gemini/claude  │
+# │  AI Provider                                  │
+# │  "gemini" = Google AI Studio (GEMINI_API_KEY) │
+# │  "claude" = Vertex AI (GCP auth)              │
 # └─────────────────────────────────────────────┘
-# Change "provider" to switch AI engine for ALL reviews.
-# Each provider uses its own API key secret.
 
-provider: "gemini"   # "gemini" or "claude"
+provider: "gemini"
 
+# Gemini models (via Google AI Studio API key)
 gemini:
   weekly_model: "gemini-2.5-flash"
   pr_model: "gemini-2.5-flash"
-  # API key secret name: GEMINI_API_KEY
 
+# Claude models (via Google Vertex AI — same Google account)
+# Requires: GCP_PROJECT_ID secret + Workload Identity or SA key
 claude:
-  weekly_model: "claude-opus-4-20250514"
-  pr_model: "claude-sonnet-4-20250514"
-  # API key secret name: ANTHROPIC_API_KEY
+  weekly_model: "claude-opus-4-6"
+  pr_model: "claude-sonnet-4-5"
+  gcp_region: "us-east5"
 
 # ┌─────────────────────────────────────────────┐
 # │  Activity filter                              │
 # └─────────────────────────────────────────────┘
-# Only review repos with activity in the last N days
 activity_days: 7
 
 # ┌─────────────────────────────────────────────┐
