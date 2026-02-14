@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""AI Code Review — supports Gemini API and Claude via Vertex AI."""
+"""AI Code Review — supports Gemini API and Claude via Vertex AI.
+   Large repos are automatically split into chunks and reviewed in parts."""
 
 import os
 import sys
@@ -22,7 +23,8 @@ SKIP_DIRS = {
 }
 
 MAX_FILE_SIZE = 50_000
-MAX_TOTAL_SIZE = 900_000
+CHUNK_SIZE = 800_000       # ~800 KB per chunk → fits in context window
+MAX_TOTAL_SIZE = 4_000_000 # 4 MB total limit across all chunks
 
 # ---------------------------------------------------------------------------
 # File collection
@@ -57,6 +59,27 @@ def build_code_context(files):
     for path, content in files.items():
         parts.append(f"### File: {path}\n```\n{content}\n```")
     return "\n\n".join(parts)
+
+
+def split_into_chunks(files):
+    """Split files into chunks that fit within CHUNK_SIZE."""
+    chunks = []
+    current_chunk = {}
+    current_size = 0
+
+    for path, content in files.items():
+        file_size = len(content.encode('utf-8'))
+        if current_size + file_size > CHUNK_SIZE and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = {}
+            current_size = 0
+        current_chunk[path] = content
+        current_size += file_size
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -105,6 +128,60 @@ Use **exactly** this output template:
 1. …
 """
 
+SYSTEM_CHUNK = """\
+You are an expert senior software architect reviewing a PART of a codebase.
+Respond in **Russian**.
+
+This is chunk {chunk_num} of {total_chunks} of the full codebase.
+Analyse ONLY the files provided below. Focus on:
+
+1. **Security Issues** — hardcoded secrets, injection risks, XSS
+2. **Refactoring Opportunities** — duplication, god objects, long methods
+3. **SOLID violations** — note any violations with scores
+4. **Test Coverage Gaps** — if relevant test files are in this chunk
+5. **Architecture concerns** — patterns, error handling, logging
+
+Be concise. Use bullet points. Mark severity: 🚨 Critical / ❌ High / ⚠️ Medium / ℹ️ Low
+Start with: **Часть {chunk_num}/{total_chunks} — файлы:** (list files)
+"""
+
+SYSTEM_MERGE = """\
+You are an expert senior software architect.
+Respond in **Russian**.
+You have received {total_chunks} partial code reviews of different parts of the same codebase.
+Merge them into a single, coherent, deduplicated report.
+
+Use **exactly** this output template:
+
+## 🤖 Еженедельный AI Code Review
+
+### Overall Health Score: X/10
+
+### 📐 SOLID: X/10
+| Принцип | Оценка | Комментарий |
+|---------|--------|-------------|
+| SRP | … | … |
+| OCP | … | … |
+| LSP | … | … |
+| ISP | … | … |
+| DIP | … | … |
+
+### 🔒 Безопасность: N проблем
+(merged list, deduplicated, with 🚨/❌/⚠️/ℹ️)
+
+### ♻️ Рефакторинг: N возможностей
+(merged list, deduplicated, prioritized)
+
+### 🧪 Тестирование: N пробелов
+(merged list)
+
+### 🏗️ Архитектура
+(overall observations across all chunks)
+
+### 📋 Приоритетный план действий
+1. …
+"""
+
 SYSTEM_PR = """\
 You are an expert code reviewer analysing a pull request diff.
 Respond in **Russian**. Be concise and actionable.
@@ -133,81 +210,45 @@ Use **exactly** this output template:
 """
 
 # ---------------------------------------------------------------------------
-# Gemini provider (Google AI Studio — uses GEMINI_API_KEY)
+# Gemini provider
 # ---------------------------------------------------------------------------
 
-def review_gemini(code_context, mode, api_key, model):
-    """Google Gemini via google-genai SDK."""
-    from google import genai
-    from google.genai import types
+def call_gemini(system, user_text, api_key, model):
+    """Single Gemini API call."""
+    try:
+        from google import genai
+        from google.genai import types
 
-    client = genai.Client(api_key=api_key)
-    system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
-    gen_cfg = types.GenerateContentConfig(
-        system_instruction=system,
-        temperature=0.2,
-        max_output_tokens=8192,
-    )
-
-    # Context caching for large full reviews
-    if mode == 'full' and len(code_context) > 32_000:
-        try:
-            cache = client.caches.create(
-                model=model,
-                config=types.CreateCachedContentConfig(
-                    system_instruction=system,
-                    contents=[types.Content(
-                        role="user",
-                        parts=[types.Part(text=(
-                            "Вот полный исходный код проекта для ревью:\n\n"
-                            + code_context
-                        ))],
-                    )],
-                    ttl="3600s",
-                    display_name="weekly-review-cache",
-                ),
-            )
-            print(f"✓ Gemini context cache created: {cache.name}", file=sys.stderr)
-            resp = client.models.generate_content(
-                model=model,
-                contents="Выполни полный еженедельный code review по инструкциям из системного промпта.",
-                config=types.GenerateContentConfig(
-                    cached_content=cache.name,
-                    temperature=0.2,
-                    max_output_tokens=8192,
-                ),
-            )
-            try:
-                client.caches.delete(cache.name)
-            except Exception:
-                pass
-            return resp.text
-        except Exception as exc:
-            print(f"⚠ Gemini cache fallback: {exc}", file=sys.stderr)
-
-    resp = client.models.generate_content(
-        model=model,
-        contents=[types.Content(
-            role="user",
-            parts=[types.Part(text=code_context + "\n\n---\nВыполни code review.")],
-        )],
-        config=gen_cfg,
-    )
-    return resp.text
+        client = genai.Client(api_key=api_key)
+        gen_cfg = types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=0.2,
+            max_output_tokens=8192,
+        )
+        resp = client.models.generate_content(
+            model=model,
+            contents=[types.Content(
+                role="user",
+                parts=[types.Part(text=user_text)],
+            )],
+            config=gen_cfg,
+        )
+        return resp.text
+    except ImportError:
+        return call_gemini_rest(system, user_text, api_key, model)
 
 
-def review_gemini_rest(code_context, mode, api_key, model):
+def call_gemini_rest(system, user_text, api_key, model):
     """Gemini REST fallback."""
     import urllib.request, urllib.error
 
-    system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/"
         f"models/{model}:generateContent?key={api_key}"
     )
     payload = json.dumps({
         "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"parts": [{"text": code_context + "\n\n---\nВыполни code review."}]}],
+        "contents": [{"parts": [{"text": user_text}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
     }).encode()
 
@@ -224,48 +265,33 @@ def review_gemini_rest(code_context, mode, api_key, model):
         return f"❌ Gemini review failed: {exc}"
 
 # ---------------------------------------------------------------------------
-# Claude provider (Vertex AI — uses GCP service account or ADC)
+# Claude provider (Vertex AI)
 # ---------------------------------------------------------------------------
 
-def review_claude_vertex(code_context, mode, model, project_id, region):
-    """Claude via Google Vertex AI using anthropic[vertex] SDK."""
-    from anthropic import AnthropicVertex
-
-    client = AnthropicVertex(project_id=project_id, region=region)
-    system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
-
-    if len(code_context) > 600_000:
-        code_context = code_context[:600_000] + "\n\n[... truncated ...]"
-
-    print(f"→ Calling Claude {model} via Vertex AI (project={project_id}, region={region})", file=sys.stderr)
-
-    message = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        temperature=0.2,
-        system=system,
-        messages=[
-            {"role": "user", "content": code_context + "\n\n---\nВыполни code review."}
-        ],
-    )
-
-    return "".join(b.text for b in message.content if hasattr(b, 'text'))
+def call_claude(system, user_text, model, project_id, region):
+    """Single Claude API call via Vertex AI."""
+    try:
+        from anthropic import AnthropicVertex
+        client = AnthropicVertex(project_id=project_id, region=region)
+        message = client.messages.create(
+            model=model,
+            max_tokens=8192,
+            temperature=0.2,
+            system=system,
+            messages=[{"role": "user", "content": user_text}],
+        )
+        return "".join(b.text for b in message.content if hasattr(b, 'text'))
+    except ImportError:
+        return call_claude_rest(system, user_text, model, project_id, region)
 
 
-def review_claude_rest(code_context, mode, model, project_id, region):
-    """Claude via Vertex AI REST (when SDK unavailable)."""
+def call_claude_rest(system, user_text, model, project_id, region):
+    """Claude via Vertex AI REST."""
     import urllib.request, urllib.error, subprocess
 
-    system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
-
-    if len(code_context) > 600_000:
-        code_context = code_context[:600_000] + "\n\n[... truncated ...]"
-
-    # Get access token from gcloud
     try:
         token = subprocess.check_output(
-            ["gcloud", "auth", "print-access-token"],
-            text=True
+            ["gcloud", "auth", "print-access-token"], text=True
         ).strip()
     except Exception as exc:
         return f"❌ Failed to get GCP access token: {exc}"
@@ -275,17 +301,13 @@ def review_claude_rest(code_context, mode, model, project_id, region):
         f"projects/{project_id}/locations/{region}/"
         f"publishers/anthropic/models/{model}:rawPredict"
     )
-
     payload = json.dumps({
         "anthropic_version": "vertex-2023-10-16",
         "max_tokens": 8192,
         "temperature": 0.2,
         "system": system,
-        "messages": [
-            {"role": "user", "content": code_context + "\n\n---\nВыполни code review."}
-        ],
+        "messages": [{"role": "user", "content": user_text}],
     }).encode()
-
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
@@ -303,41 +325,67 @@ def review_claude_rest(code_context, mode, model, project_id, region):
         return f"❌ Claude review failed: {exc}"
 
 # ---------------------------------------------------------------------------
-# Provider dispatcher
+# Unified caller
 # ---------------------------------------------------------------------------
 
-def run_review(code_context, mode, provider, model, **kwargs):
-    """Route to the right provider."""
-
+def ai_call(system, user_text, provider, model, **kwargs):
+    """Route a single AI call to the right provider."""
     if provider == "gemini":
         api_key = kwargs.get("api_key") or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             sys.exit("Error: GEMINI_API_KEY not set")
-        model = model or "gemini-2.5-flash"
-        print(f"→ Provider: Gemini, Model: {model}", file=sys.stderr)
-        try:
-            from google import genai  # noqa: F401
-            return review_gemini(code_context, mode, api_key, model)
-        except ImportError:
-            print("⚠ google-genai not installed, using REST", file=sys.stderr)
-            return review_gemini_rest(code_context, mode, api_key, model)
-
+        return call_gemini(system, user_text, api_key, model)
     elif provider == "claude":
         project_id = kwargs.get("gcp_project") or os.environ.get("GCP_PROJECT_ID")
         region = kwargs.get("gcp_region") or os.environ.get("GCP_REGION", "us-east5")
-        model = model or "claude-opus-4-6"
         if not project_id:
-            sys.exit("Error: GCP_PROJECT_ID not set (required for Claude via Vertex AI)")
-        print(f"→ Provider: Claude (Vertex AI), Model: {model}", file=sys.stderr)
-        try:
-            from anthropic import AnthropicVertex  # noqa: F401
-            return review_claude_vertex(code_context, mode, model, project_id, region)
-        except ImportError:
-            print("⚠ anthropic[vertex] not installed, using REST", file=sys.stderr)
-            return review_claude_rest(code_context, mode, model, project_id, region)
-
+            sys.exit("Error: GCP_PROJECT_ID not set")
+        return call_claude(system, user_text, model, project_id, region)
     else:
         sys.exit(f"Unknown provider: {provider}")
+
+# ---------------------------------------------------------------------------
+# Review logic — single chunk or multi-chunk
+# ---------------------------------------------------------------------------
+
+def review_single(files, mode, provider, model, **kwargs):
+    """Review when all files fit in one chunk."""
+    context = build_code_context(files)
+    system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
+    print(f"→ Single-chunk review: {len(files)} files", file=sys.stderr)
+    return ai_call(system, context + "\n\n---\nВыполни code review.", provider, model, **kwargs)
+
+
+def review_chunked(files, provider, model, **kwargs):
+    """Split large repos into chunks, review each, then merge."""
+    chunks = split_into_chunks(files)
+    total = len(chunks)
+    print(f"→ Multi-chunk review: {len(files)} files split into {total} chunks", file=sys.stderr)
+
+    partial_reviews = []
+    for i, chunk_files in enumerate(chunks, 1):
+        file_list = ", ".join(chunk_files.keys())
+        print(f"  Chunk {i}/{total}: {len(chunk_files)} files ({file_list[:120]}...)", file=sys.stderr)
+
+        system = SYSTEM_CHUNK.format(chunk_num=i, total_chunks=total)
+        context = build_code_context(chunk_files)
+        user_text = context + "\n\n---\nВыполни анализ этой части кодовой базы."
+
+        result = ai_call(system, user_text, provider, model, **kwargs)
+        partial_reviews.append(result)
+        print(f"  ✓ Chunk {i}/{total} done ({len(result)} chars)", file=sys.stderr)
+
+    # Merge all partial reviews
+    print(f"→ Merging {total} partial reviews...", file=sys.stderr)
+    merge_system = SYSTEM_MERGE.format(total_chunks=total)
+    merge_input = "\n\n---\n\n".join(
+        f"## Partial Review {i+1}/{total}\n\n{review}"
+        for i, review in enumerate(partial_reviews)
+    )
+    merge_input += "\n\n---\nОбъедини все частичные ревью в один финальный отчёт."
+
+    final = ai_call(merge_system, merge_input, provider, model, **kwargs)
+    return final
 
 # ---------------------------------------------------------------------------
 # Main
@@ -351,38 +399,45 @@ def main():
     ap.add_argument("--diff-file", default=None)
     ap.add_argument("--model", default=None)
     ap.add_argument("--output", default=None)
-    # Gemini-specific
     ap.add_argument("--api-key", default=None)
-    # Claude/Vertex-specific
     ap.add_argument("--gcp-project", default=None)
     ap.add_argument("--gcp-region", default=None)
     args = ap.parse_args()
 
-    # Build context
+    model = args.model
+    if not model:
+        model = "gemini-2.5-flash" if args.provider == "gemini" else "claude-opus-4-6"
+
+    extra = dict(api_key=args.api_key, gcp_project=args.gcp_project, gcp_region=args.gcp_region)
+
+    print(f"→ Provider: {args.provider}, Model: {model}", file=sys.stderr)
+
+    # PR mode
     if args.mode == "pr" and args.diff_file:
         with open(args.diff_file, "r") as f:
             context = f.read()
         if not context.strip():
             report = "✅ Нет изменений для ревью."
-            if args.output:
-                Path(args.output).write_text(report)
-            else:
-                print(report)
-            return
-    else:
-        files = collect_files(args.project_dir)
-        if not files:
-            sys.exit("No source files found.")
-        context = build_code_context(files)
-        print(f"Collected {len(files)} files for review", file=sys.stderr)
+        else:
+            report = ai_call(SYSTEM_PR, context + "\n\n---\nВыполни review PR.", args.provider, model, **extra)
+        if args.output:
+            Path(args.output).write_text(report, encoding="utf-8")
+        else:
+            print(report)
+        return
 
-    # Run review
-    report = run_review(
-        context, args.mode, args.provider, args.model,
-        api_key=args.api_key,
-        gcp_project=args.gcp_project,
-        gcp_region=args.gcp_region,
-    )
+    # Full review mode
+    files = collect_files(args.project_dir)
+    if not files:
+        sys.exit("No source files found.")
+
+    total_size = sum(len(c.encode('utf-8')) for c in files.values())
+    print(f"Collected {len(files)} files ({total_size:,} bytes) for review", file=sys.stderr)
+
+    if total_size <= CHUNK_SIZE:
+        report = review_single(files, 'full', args.provider, model, **extra)
+    else:
+        report = review_chunked(files, args.provider, model, **extra)
 
     if args.output:
         Path(args.output).write_text(report, encoding="utf-8")
