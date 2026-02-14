@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI Code Review — supports Gemini and Claude APIs with switchable provider."""
+"""AI Code Review — supports Gemini API and Claude via Vertex AI."""
 
 import os
 import sys
@@ -133,11 +133,11 @@ Use **exactly** this output template:
 """
 
 # ---------------------------------------------------------------------------
-# Gemini API
+# Gemini provider (Google AI Studio — uses GEMINI_API_KEY)
 # ---------------------------------------------------------------------------
 
-def review_gemini_sdk(code_context, mode, api_key, model):
-    """Google Gemini via google-genai SDK (with context caching)."""
+def review_gemini(code_context, mode, api_key, model):
+    """Google Gemini via google-genai SDK."""
     from google import genai
     from google.genai import types
 
@@ -149,7 +149,7 @@ def review_gemini_sdk(code_context, mode, api_key, model):
         max_output_tokens=8192,
     )
 
-    # Explicit context caching for large full reviews
+    # Context caching for large full reviews
     if mode == 'full' and len(code_context) > 32_000:
         try:
             cache = client.caches.create(
@@ -168,7 +168,6 @@ def review_gemini_sdk(code_context, mode, api_key, model):
                 ),
             )
             print(f"✓ Gemini context cache created: {cache.name}", file=sys.stderr)
-
             resp = client.models.generate_content(
                 model=model,
                 contents="Выполни полный еженедельный code review по инструкциям из системного промпта.",
@@ -198,7 +197,7 @@ def review_gemini_sdk(code_context, mode, api_key, model):
 
 
 def review_gemini_rest(code_context, mode, api_key, model):
-    """Gemini REST fallback when SDK is unavailable."""
+    """Gemini REST fallback."""
     import urllib.request, urllib.error
 
     system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
@@ -214,7 +213,7 @@ def review_gemini_rest(code_context, mode, api_key, model):
 
     req = urllib.request.Request(url, payload, {"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
             body = json.loads(r.read())
             return body["candidates"][0]["content"]["parts"][0]["text"]
     except urllib.error.HTTPError as exc:
@@ -222,25 +221,23 @@ def review_gemini_rest(code_context, mode, api_key, model):
         print(f"Gemini REST error {exc.code}: {err}", file=sys.stderr)
         return f"❌ Gemini review failed: HTTP {exc.code}"
     except Exception as exc:
-        print(f"Gemini REST error: {exc}", file=sys.stderr)
         return f"❌ Gemini review failed: {exc}"
 
 # ---------------------------------------------------------------------------
-# Claude API
+# Claude provider (Vertex AI — uses GCP service account or ADC)
 # ---------------------------------------------------------------------------
 
-def review_claude_sdk(code_context, mode, api_key, model):
-    """Anthropic Claude via anthropic SDK."""
-    import anthropic
+def review_claude_vertex(code_context, mode, model, project_id, region):
+    """Claude via Google Vertex AI using anthropic[vertex] SDK."""
+    from anthropic import AnthropicVertex
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = AnthropicVertex(project_id=project_id, region=region)
     system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
 
-    # Truncate if too large for Claude (200K context window)
     if len(code_context) > 600_000:
-        code_context = code_context[:600_000] + "\n\n[... truncated due to size ...]"
+        code_context = code_context[:600_000] + "\n\n[... truncated ...]"
 
-    print(f"→ Calling Claude {model} ({len(code_context)} chars)", file=sys.stderr)
+    print(f"→ Calling Claude {model} via Vertex AI (project={project_id}, region={region})", file=sys.stderr)
 
     message = client.messages.create(
         model=model,
@@ -252,26 +249,35 @@ def review_claude_sdk(code_context, mode, api_key, model):
         ],
     )
 
-    # Extract text from response
-    result = ""
-    for block in message.content:
-        if hasattr(block, 'text'):
-            result += block.text
-    return result
+    return "".join(b.text for b in message.content if hasattr(b, 'text'))
 
 
-def review_claude_rest(code_context, mode, api_key, model):
-    """Claude REST fallback when SDK is unavailable."""
-    import urllib.request, urllib.error
+def review_claude_rest(code_context, mode, model, project_id, region):
+    """Claude via Vertex AI REST (when SDK unavailable)."""
+    import urllib.request, urllib.error, subprocess
 
     system = SYSTEM_FULL if mode == 'full' else SYSTEM_PR
 
     if len(code_context) > 600_000:
-        code_context = code_context[:600_000] + "\n\n[... truncated due to size ...]"
+        code_context = code_context[:600_000] + "\n\n[... truncated ...]"
 
-    url = "https://api.anthropic.com/v1/messages"
+    # Get access token from gcloud
+    try:
+        token = subprocess.check_output(
+            ["gcloud", "auth", "print-access-token"],
+            text=True
+        ).strip()
+    except Exception as exc:
+        return f"❌ Failed to get GCP access token: {exc}"
+
+    url = (
+        f"https://{region}-aiplatform.googleapis.com/v1/"
+        f"projects/{project_id}/locations/{region}/"
+        f"publishers/anthropic/models/{model}:rawPredict"
+    )
+
     payload = json.dumps({
-        "model": model,
+        "anthropic_version": "vertex-2023-10-16",
         "max_tokens": 8192,
         "temperature": 0.2,
         "system": system,
@@ -282,8 +288,7 @@ def review_claude_rest(code_context, mode, api_key, model):
 
     headers = {
         "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
+        "Authorization": f"Bearer {token}",
     }
     req = urllib.request.Request(url, payload, headers)
     try:
@@ -292,50 +297,47 @@ def review_claude_rest(code_context, mode, api_key, model):
             return "".join(b["text"] for b in body["content"] if b["type"] == "text")
     except urllib.error.HTTPError as exc:
         err = exc.read().decode()
-        print(f"Claude REST error {exc.code}: {err}", file=sys.stderr)
+        print(f"Claude Vertex REST error {exc.code}: {err}", file=sys.stderr)
         return f"❌ Claude review failed: HTTP {exc.code}"
     except Exception as exc:
-        print(f"Claude REST error: {exc}", file=sys.stderr)
         return f"❌ Claude review failed: {exc}"
 
 # ---------------------------------------------------------------------------
 # Provider dispatcher
 # ---------------------------------------------------------------------------
 
-PROVIDERS = {
-    "gemini": {
-        "sdk_fn": review_gemini_sdk,
-        "rest_fn": review_gemini_rest,
-        "sdk_import": "google.genai",
-        "sdk_package": "google-genai",
-        "env_key": "GEMINI_API_KEY",
-        "default_model": "gemini-2.5-flash",
-    },
-    "claude": {
-        "sdk_fn": review_claude_sdk,
-        "rest_fn": review_claude_rest,
-        "sdk_import": "anthropic",
-        "sdk_package": "anthropic",
-        "env_key": "ANTHROPIC_API_KEY",
-        "default_model": "claude-opus-4-20250514",
-    },
-}
+def run_review(code_context, mode, provider, model, **kwargs):
+    """Route to the right provider."""
 
+    if provider == "gemini":
+        api_key = kwargs.get("api_key") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            sys.exit("Error: GEMINI_API_KEY not set")
+        model = model or "gemini-2.5-flash"
+        print(f"→ Provider: Gemini, Model: {model}", file=sys.stderr)
+        try:
+            from google import genai  # noqa: F401
+            return review_gemini(code_context, mode, api_key, model)
+        except ImportError:
+            print("⚠ google-genai not installed, using REST", file=sys.stderr)
+            return review_gemini_rest(code_context, mode, api_key, model)
 
-def run_review(code_context, mode, provider, api_key, model):
-    """Run review using the specified provider."""
-    p = PROVIDERS[provider]
-    if not model:
-        model = p["default_model"]
+    elif provider == "claude":
+        project_id = kwargs.get("gcp_project") or os.environ.get("GCP_PROJECT_ID")
+        region = kwargs.get("gcp_region") or os.environ.get("GCP_REGION", "us-east5")
+        model = model or "claude-opus-4-6"
+        if not project_id:
+            sys.exit("Error: GCP_PROJECT_ID not set (required for Claude via Vertex AI)")
+        print(f"→ Provider: Claude (Vertex AI), Model: {model}", file=sys.stderr)
+        try:
+            from anthropic import AnthropicVertex  # noqa: F401
+            return review_claude_vertex(code_context, mode, model, project_id, region)
+        except ImportError:
+            print("⚠ anthropic[vertex] not installed, using REST", file=sys.stderr)
+            return review_claude_rest(code_context, mode, model, project_id, region)
 
-    # Try SDK first, fall back to REST
-    try:
-        __import__(p["sdk_import"])
-        print(f"→ Using {provider} SDK ({model})", file=sys.stderr)
-        return p["sdk_fn"](code_context, mode, api_key, model)
-    except ImportError:
-        print(f"⚠ {p['sdk_package']} not installed, using REST API", file=sys.stderr)
-        return p["rest_fn"](code_context, mode, api_key, model)
+    else:
+        sys.exit(f"Unknown provider: {provider}")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -347,24 +349,20 @@ def main():
     ap.add_argument("--provider", choices=["gemini", "claude"], default="gemini")
     ap.add_argument("--project-dir", default=".")
     ap.add_argument("--diff-file", default=None)
-    ap.add_argument("--api-key", default=None)
     ap.add_argument("--model", default=None)
     ap.add_argument("--output", default=None)
+    # Gemini-specific
+    ap.add_argument("--api-key", default=None)
+    # Claude/Vertex-specific
+    ap.add_argument("--gcp-project", default=None)
+    ap.add_argument("--gcp-region", default=None)
     args = ap.parse_args()
-
-    provider = args.provider
-    p = PROVIDERS[provider]
-
-    api_key = args.api_key or os.environ.get(p["env_key"])
-    if not api_key:
-        sys.exit(f"Error: {p['env_key']} not set")
 
     # Build context
     if args.mode == "pr" and args.diff_file:
         with open(args.diff_file, "r") as f:
             context = f.read()
         if not context.strip():
-            print("Empty diff, nothing to review.", file=sys.stderr)
             report = "✅ Нет изменений для ревью."
             if args.output:
                 Path(args.output).write_text(report)
@@ -379,9 +377,13 @@ def main():
         print(f"Collected {len(files)} files for review", file=sys.stderr)
 
     # Run review
-    report = run_review(context, args.mode, provider, api_key, args.model)
+    report = run_review(
+        context, args.mode, args.provider, args.model,
+        api_key=args.api_key,
+        gcp_project=args.gcp_project,
+        gcp_region=args.gcp_region,
+    )
 
-    # Output
     if args.output:
         Path(args.output).write_text(report, encoding="utf-8")
         print(f"Report written to {args.output}", file=sys.stderr)
