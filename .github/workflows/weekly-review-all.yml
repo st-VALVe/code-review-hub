@@ -1,4 +1,4 @@
-name: "Weekly AI Review \u2014 All Repos"
+name: "Weekly AI Review — Active Repos Only"
 
 on:
   schedule:
@@ -6,13 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       single_repo:
-        description: "Review only this repo (leave blank for all)"
+        description: "Review only this repo (leave blank for active repos)"
         required: false
         default: ""
+      activity_days:
+        description: "Consider repos active if pushed within N days (default: 7)"
+        required: false
+        default: "7"
 
 jobs:
   discover:
-    name: "Discover repositories"
+    name: "Discover active repositories"
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.list.outputs.repos }}
@@ -20,18 +24,15 @@ jobs:
       - name: Checkout hub
         uses: actions/checkout@v4
 
-      - name: List repos
+      - name: Find active repos
         id: list
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           OWNER=$(grep 'github_owner' config.yml | awk '{print $2}' | tr -d '"')
+          ACTIVITY_DAYS="${{ github.event.inputs.activity_days || '7' }}"
 
-          # Fetch all non-fork, non-archived repos
-          REPOS=$(gh api --paginate "/users/${OWNER}/repos?per_page=100&type=owner" \
-            --jq '[.[] | select(.fork == false and .archived == false) | .name]')
-
-          # Read exclusions from config
+          # Read config
           EXCLUDE=$(python3 -c "
           import yaml, json
           with open('config.yml') as f:
@@ -46,26 +47,64 @@ jobs:
           print(json.dumps(cfg.get('include_only', [])))
           ")
 
-          # Filter
+          # Fetch all repos with pushed_at dates
+          REPOS_RAW=$(gh api --paginate "/users/${OWNER}/repos?per_page=100&type=owner" \
+            --jq '[.[] | select(.fork == false and .archived == false) | {name: .name, pushed_at: .pushed_at}]')
+
+          # Filter: only repos with activity in the last N days
           FILTERED=$(python3 -c "
           import json, sys
-          repos = json.loads('$REPOS')
+          from datetime import datetime, timedelta, timezone
+
+          repos_raw = json.loads('$REPOS_RAW')
           exclude = json.loads('$EXCLUDE')
           include_only = json.loads('$INCLUDE_ONLY')
           single = '${{ github.event.inputs.single_repo }}'.strip()
+          activity_days = int('$ACTIVITY_DAYS')
 
-          if single:
-              repos = [single] if single in repos else []
-          elif include_only:
-              repos = [r for r in repos if r in include_only]
-          else:
-              repos = [r for r in repos if r not in exclude]
+          cutoff = datetime.now(timezone.utc) - timedelta(days=activity_days)
+          active = []
+          skipped = []
 
-          print(json.dumps(repos))
+          for r in repos_raw:
+              name = r['name']
+              pushed = datetime.fromisoformat(r['pushed_at'].replace('Z', '+00:00'))
+
+              # Apply include/exclude filters
+              if single:
+                  if name != single:
+                      continue
+              elif include_only:
+                  if name not in include_only:
+                      continue
+              else:
+                  if name in exclude:
+                      continue
+
+              # Check activity
+              if pushed >= cutoff:
+                  active.append(name)
+              else:
+                  skipped.append(f'{name} (last push: {r[\"pushed_at\"][:10]})')
+
+          print(json.dumps(active))
+
+          # Print skipped for logging
+          import sys as _sys
+          for s in skipped:
+              print(f'💤 Skipped inactive: {s}', file=_sys.stderr)
           ")
 
           echo "repos=$FILTERED" >> $GITHUB_OUTPUT
-          echo "\U0001f4cb Repos to review: $FILTERED" >> $GITHUB_STEP_SUMMARY
+
+          # Summary
+          ACTIVE_COUNT=$(echo "$FILTERED" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          echo "## 📋 Repository Discovery" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Activity window:** last ${ACTIVITY_DAYS} days" >> $GITHUB_STEP_SUMMARY
+          echo "**Active repos:** ${ACTIVE_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Will review:** ${FILTERED}" >> $GITHUB_STEP_SUMMARY
 
   review:
     name: "Review ${{ matrix.repo }}"
@@ -118,7 +157,7 @@ jobs:
             --model "$MODEL" \
             --output review_report.md
 
-          echo "\u2705 Review completed for ${{ matrix.repo }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Review completed for ${{ matrix.repo }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Create issue in target repo
         env:
@@ -143,18 +182,18 @@ jobs:
           ${REPORT}
 
           ---
-          *\U0001f916 Автоматически сгенерировано [code-review-hub](https://github.com/${OWNER}/code-review-hub) \u00b7 Gemini AI \u00b7 ${DATE}*
+          *🤖 Автоматически сгенерировано [code-review-hub](https://github.com/${OWNER}/code-review-hub) · Gemini AI · ${DATE}*
           ISSUE_EOF
           )
 
           gh issue create \
             --repo "${OWNER}/${{ matrix.repo }}" \
-            --title "[AI Review] Еженедельный отчёт \u2014 ${DATE}" \
+            --title "[AI Review] Еженедельный отчёт — ${DATE}" \
             --body "$BODY" \
             --label "ai-code-review,automated" 2>/dev/null || \
           gh issue create \
             --repo "${OWNER}/${{ matrix.repo }}" \
-            --title "[AI Review] Еженедельный отчёт \u2014 ${DATE}" \
+            --title "[AI Review] Еженедельный отчёт — ${DATE}" \
             --body "$BODY"
 
       - name: Upload report artifact
@@ -187,9 +226,8 @@ jobs:
           DATE=$(date +%Y-%m-%d)
           REPOS='${{ needs.discover.outputs.repos }}'
 
-          # Build combined summary
-          SUMMARY="# \U0001f4ca Weekly AI Review Summary \u2014 ${DATE}\n\n"
-          SUMMARY+="**Repos reviewed:** $(echo "$REPOS" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')\n\n"
+          SUMMARY="# 📊 Weekly AI Review Summary — ${DATE}\n\n"
+          SUMMARY+="**Active repos reviewed:** $(echo "$REPOS" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')\n\n"
 
           for dir in reports/review-*/; do
             REPO_NAME=$(basename "$dir" | sed 's/review-//')
@@ -214,5 +252,5 @@ jobs:
             curl -sf -X POST "$WEBHOOK_URL" \
               -H "Content-Type: application/json" \
               -d "$PAYLOAD" \
-              --max-time 30 || echo "\u26a0\ufe0f Webhook delivery failed"
+              --max-time 30 || echo "⚠️ Webhook delivery failed"
           fi
