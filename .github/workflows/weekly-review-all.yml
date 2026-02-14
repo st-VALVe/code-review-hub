@@ -2,7 +2,7 @@ name: "Weekly AI Review — Active Repos Only"
 
 on:
   schedule:
-    - cron: '0 6 * * 0'  # Sunday 6:00 UTC
+    - cron: '0 6 * * 0'
   workflow_dispatch:
     inputs:
       single_repo:
@@ -10,9 +10,17 @@ on:
         required: false
         default: ""
       activity_days:
-        description: "Consider repos active if pushed within N days (default: 7)"
+        description: "Consider repos active if pushed within N days (default: from config)"
         required: false
-        default: "7"
+        default: ""
+      provider:
+        description: "AI provider override (leave blank to use config.yml)"
+        required: false
+        type: choice
+        options:
+          - ""
+          - "gemini"
+          - "claude"
 
 jobs:
   discover:
@@ -20,9 +28,32 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.list.outputs.repos }}
+      provider: ${{ steps.config.outputs.provider }}
+      model: ${{ steps.config.outputs.model }}
     steps:
       - name: Checkout hub
         uses: actions/checkout@v4
+
+      - name: Read config
+        id: config
+        run: |
+          pip install -q pyyaml
+
+          python3 -c "
+          import yaml, os
+          with open('config.yml') as f:
+              cfg = yaml.safe_load(f)
+
+          # Provider: input override > config
+          override = '${{ github.event.inputs.provider }}'.strip()
+          provider = override if override else cfg.get('provider', 'gemini')
+          model = cfg.get(provider, {}).get('weekly_model', '')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'provider={provider}\n')
+              out.write(f'model={model}\n')
+          print(f'✓ Provider: {provider}, Model: {model}')
+          "
 
       - name: Find active repos
         id: list
@@ -30,9 +61,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           OWNER=$(grep 'github_owner' config.yml | awk '{print $2}' | tr -d '"')
-          ACTIVITY_DAYS="${{ github.event.inputs.activity_days || '7' }}"
+          
+          # Activity days: input > config > default 7
+          INPUT_DAYS="${{ github.event.inputs.activity_days }}"
+          CONFIG_DAYS=$(python3 -c "
+          import yaml
+          with open('config.yml') as f:
+              print(yaml.safe_load(f).get('activity_days', 7))
+          ")
+          ACTIVITY_DAYS="${INPUT_DAYS:-$CONFIG_DAYS}"
 
-          # Read config
           EXCLUDE=$(python3 -c "
           import yaml, json
           with open('config.yml') as f:
@@ -47,16 +85,14 @@ jobs:
           print(json.dumps(cfg.get('include_only', [])))
           ")
 
-          # Fetch all repos with pushed_at dates
           REPOS_RAW=$(gh api --paginate "/users/${OWNER}/repos?per_page=100&type=owner" \
             --jq '[.[] | select(.fork == false and .archived == false) | {name: .name, pushed_at: .pushed_at}]')
 
-          # Filter: only repos with activity in the last N days
           FILTERED=$(python3 -c "
           import json, sys
           from datetime import datetime, timedelta, timezone
 
-          repos_raw = json.loads('$REPOS_RAW')
+          repos_raw = json.loads('''$REPOS_RAW''')
           exclude = json.loads('$EXCLUDE')
           include_only = json.loads('$INCLUDE_ONLY')
           single = '${{ github.event.inputs.single_repo }}'.strip()
@@ -70,7 +106,6 @@ jobs:
               name = r['name']
               pushed = datetime.fromisoformat(r['pushed_at'].replace('Z', '+00:00'))
 
-              # Apply include/exclude filters
               if single:
                   if name != single:
                       continue
@@ -81,29 +116,24 @@ jobs:
                   if name in exclude:
                       continue
 
-              # Check activity
               if pushed >= cutoff:
                   active.append(name)
               else:
                   skipped.append(f'{name} (last push: {r[\"pushed_at\"][:10]})')
 
           print(json.dumps(active))
-
-          # Print skipped for logging
-          import sys as _sys
           for s in skipped:
-              print(f'💤 Skipped inactive: {s}', file=_sys.stderr)
+              print(f'💤 Skipped inactive: {s}', file=sys.stderr)
           ")
 
           echo "repos=$FILTERED" >> $GITHUB_OUTPUT
 
-          # Summary
           ACTIVE_COUNT=$(echo "$FILTERED" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
           echo "## 📋 Repository Discovery" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Provider:** ${{ steps.config.outputs.provider }}" >> $GITHUB_STEP_SUMMARY
           echo "**Activity window:** last ${ACTIVITY_DAYS} days" >> $GITHUB_STEP_SUMMARY
           echo "**Active repos:** ${ACTIVE_COUNT}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Will review:** ${FILTERED}" >> $GITHUB_STEP_SUMMARY
 
   review:
@@ -137,37 +167,42 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install google-genai
-        run: pip install -q google-genai pyyaml
+      - name: Install dependencies
+        run: |
+          PROVIDER="${{ needs.discover.outputs.provider }}"
+          pip install -q pyyaml
+          if [ "$PROVIDER" = "claude" ]; then
+            pip install -q anthropic
+          else
+            pip install -q google-genai
+          fi
 
       - name: Run AI review
-        id: review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          MODEL=$(python3 -c "
-          import yaml
-          with open('hub/config.yml') as f:
-              print(yaml.safe_load(f).get('gemini', {}).get('weekly_model', 'gemini-2.5-flash'))
-          ")
+          PROVIDER="${{ needs.discover.outputs.provider }}"
+          MODEL="${{ needs.discover.outputs.model }}"
 
           python hub/scripts/ai-review.py \
             --mode full \
+            --provider "$PROVIDER" \
             --project-dir target \
             --model "$MODEL" \
             --output review_report.md
 
-          echo "✅ Review completed for ${{ matrix.repo }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Review completed for ${{ matrix.repo }} (${PROVIDER})" >> $GITHUB_STEP_SUMMARY
 
       - name: Create issue in target repo
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           OWNER=$(grep 'github_owner' hub/config.yml | awk '{print $2}' | tr -d '"')
+          PROVIDER="${{ needs.discover.outputs.provider }}"
           DATE=$(date +%Y-%m-%d)
           REPORT=$(cat review_report.md)
 
-          # Close previous automated issues
           gh issue list \
             --repo "${OWNER}/${{ matrix.repo }}" \
             --label "ai-code-review,automated" \
@@ -177,12 +212,11 @@ jobs:
               gh issue close "$num" --repo "${OWNER}/${{ matrix.repo }}" 2>/dev/null || true
             done
 
-          # Create new issue
           BODY=$(cat <<ISSUE_EOF
           ${REPORT}
 
           ---
-          *🤖 Автоматически сгенерировано [code-review-hub](https://github.com/${OWNER}/code-review-hub) · Gemini AI · ${DATE}*
+          *🤖 Автоматически сгенерировано [code-review-hub](https://github.com/${OWNER}/code-review-hub) · ${PROVIDER} · ${DATE}*
           ISSUE_EOF
           )
 
@@ -225,8 +259,10 @@ jobs:
           OWNER=$(grep 'github_owner' config.yml | awk '{print $2}' | tr -d '"')
           DATE=$(date +%Y-%m-%d)
           REPOS='${{ needs.discover.outputs.repos }}'
+          PROVIDER='${{ needs.discover.outputs.provider }}'
 
           SUMMARY="# 📊 Weekly AI Review Summary — ${DATE}\n\n"
+          SUMMARY+="**Provider:** ${PROVIDER}\n"
           SUMMARY+="**Active repos reviewed:** $(echo "$REPOS" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')\n\n"
 
           for dir in reports/review-*/; do
@@ -239,15 +275,15 @@ jobs:
 
           echo -e "$SUMMARY" >> $GITHUB_STEP_SUMMARY
 
-          # Send webhook if configured
           if [ -n "$WEBHOOK_URL" ]; then
             PAYLOAD=$(jq -n \
               --arg event "weekly_review_summary" \
               --arg date "$DATE" \
               --arg owner "$OWNER" \
+              --arg provider "$PROVIDER" \
               --argjson repos "$REPOS" \
               --arg summary "$(echo -e "$SUMMARY")" \
-              '{event:$event, date:$date, owner:$owner, repos:$repos, summary:$summary}')
+              '{event:$event, date:$date, owner:$owner, provider:$provider, repos:$repos, summary:$summary}')
 
             curl -sf -X POST "$WEBHOOK_URL" \
               -H "Content-Type: application/json" \
