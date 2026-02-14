@@ -44,7 +44,6 @@ jobs:
           with open('config.yml') as f:
               cfg = yaml.safe_load(f)
 
-          # Provider: input override > config
           override = '${{ github.event.inputs.provider }}'.strip()
           provider = override if override else cfg.get('provider', 'gemini')
           model = cfg.get(provider, {}).get('weekly_model', '')
@@ -61,8 +60,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           OWNER=$(grep 'github_owner' config.yml | awk '{print $2}' | tr -d '"')
-          
-          # Activity days: input > config > default 7
+
           INPUT_DAYS="${{ github.event.inputs.activity_days }}"
           CONFIG_DAYS=$(python3 -c "
           import yaml
@@ -85,8 +83,9 @@ jobs:
           print(json.dumps(cfg.get('include_only', [])))
           ")
 
-          REPOS_RAW=$(gh api --paginate "/users/${OWNER}/repos?per_page=100&type=owner" \
-            --jq '[.[] | select(.fork == false and .archived == false) | {name: .name, pushed_at: .pushed_at}]')
+          # USE /user/repos (authenticated) to see PRIVATE repos!
+          REPOS_RAW=$(gh api --paginate "/user/repos?per_page=100&affiliation=owner" \
+            --jq '[.[] | select(.fork == false and .archived == false) | {name: .name, pushed_at: .pushed_at, private: .private}]')
 
           FILTERED=$(python3 -c "
           import json, sys
@@ -105,6 +104,7 @@ jobs:
           for r in repos_raw:
               name = r['name']
               pushed = datetime.fromisoformat(r['pushed_at'].replace('Z', '+00:00'))
+              priv = '🔒' if r.get('private') else '🌐'
 
               if single:
                   if name != single:
@@ -118,12 +118,12 @@ jobs:
 
               if pushed >= cutoff:
                   active.append(name)
+                  print(f'✅ {priv} {name} (pushed: {r[\"pushed_at\"][:10]})', file=sys.stderr)
               else:
-                  skipped.append(f'{name} (last push: {r[\"pushed_at\"][:10]})')
+                  skipped.append(name)
+                  print(f'💤 {priv} {name} (last push: {r[\"pushed_at\"][:10]})', file=sys.stderr)
 
           print(json.dumps(active))
-          for s in skipped:
-              print(f'💤 Skipped inactive: {s}', file=sys.stderr)
           ")
 
           echo "repos=$FILTERED" >> $GITHUB_OUTPUT
@@ -172,7 +172,7 @@ jobs:
           PROVIDER="${{ needs.discover.outputs.provider }}"
           pip install -q pyyaml
           if [ "$PROVIDER" = "claude" ]; then
-            pip install -q anthropic
+            pip install -q 'anthropic[vertex]'
           else
             pip install -q google-genai
           fi
@@ -180,7 +180,7 @@ jobs:
       - name: Run AI review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
           PROVIDER="${{ needs.discover.outputs.provider }}"
           MODEL="${{ needs.discover.outputs.model }}"
