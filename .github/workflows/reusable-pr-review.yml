@@ -1,0 +1,125 @@
+name: "Reusable: AI PR Review"
+
+on:
+  workflow_call:
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  ai-review:
+    name: Gemini AI Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout hub (for scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: st-VALVe/code-review-hub
+          path: _hub
+          sparse-checkout: |
+            scripts/ai-review.py
+            config.yml
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }}...HEAD -- \
+            '*.js' '*.ts' '*.tsx' '*.jsx' '*.py' '*.css' '*.html' '*.yml' '*.yaml' '*.json' '*.sql' \
+            ':!package-lock.json' ':!yarn.lock' ':!*.min.js' ':!*.min.css' \
+            > pr_diff.txt
+
+          DIFF_SIZE=$(wc -c < pr_diff.txt)
+          echo "size=$DIFF_SIZE" >> $GITHUB_OUTPUT
+
+          if [ "$DIFF_SIZE" -eq 0 ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            if [ "$DIFF_SIZE" -gt 120000 ]; then
+              head -c 120000 pr_diff.txt > pr_diff_trunc.txt
+              mv pr_diff_trunc.txt pr_diff.txt
+            fi
+          fi
+
+      - name: Setup Python
+        if: steps.diff.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install google-genai
+        if: steps.diff.outputs.skip != 'true'
+        run: pip install -q google-genai pyyaml
+
+      - name: Run AI Review
+        if: steps.diff.outputs.skip != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          MODEL=$(python3 -c "
+          import yaml
+          with open('_hub/config.yml') as f:
+              print(yaml.safe_load(f).get('gemini', {}).get('pr_model', 'gemini-2.5-flash'))
+          " 2>/dev/null || echo "gemini-2.5-flash")
+
+          python _hub/scripts/ai-review.py \
+            --mode pr \
+            --diff-file pr_diff.txt \
+            --model "$MODEL" \
+            --output review_report.md
+
+      - name: Comment on PR
+        if: steps.diff.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report;
+            try {
+              report = fs.readFileSync('review_report.md', 'utf8');
+            } catch {
+              report = '\u26a0\ufe0f AI review did not produce a report.';
+            }
+
+            const body = `${report}\n\n---\n*\U0001f916 Powered by Gemini AI \u00b7 [code-review-hub](https://github.com/${{ github.repository_owner }}/code-review-hub) \u00b7 \`${context.sha.substring(0, 7)}\`*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' &&
+              c.body.includes('Powered by Gemini AI')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: No changes
+        if: steps.diff.outputs.skip == 'true'
+        run: echo "\u2705 No reviewable code changes in this PR." >> $GITHUB_STEP_SUMMARY

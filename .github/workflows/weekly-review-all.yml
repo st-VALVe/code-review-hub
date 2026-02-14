@@ -1,0 +1,218 @@
+name: "Weekly AI Review \u2014 All Repos"
+
+on:
+  schedule:
+    - cron: '0 6 * * 0'  # Sunday 6:00 UTC
+  workflow_dispatch:
+    inputs:
+      single_repo:
+        description: "Review only this repo (leave blank for all)"
+        required: false
+        default: ""
+
+jobs:
+  discover:
+    name: "Discover repositories"
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.list.outputs.repos }}
+    steps:
+      - name: Checkout hub
+        uses: actions/checkout@v4
+
+      - name: List repos
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          OWNER=$(grep 'github_owner' config.yml | awk '{print $2}' | tr -d '"')
+
+          # Fetch all non-fork, non-archived repos
+          REPOS=$(gh api --paginate "/users/${OWNER}/repos?per_page=100&type=owner" \
+            --jq '[.[] | select(.fork == false and .archived == false) | .name]')
+
+          # Read exclusions from config
+          EXCLUDE=$(python3 -c "
+          import yaml, json
+          with open('config.yml') as f:
+              cfg = yaml.safe_load(f)
+          print(json.dumps(cfg.get('exclude_repos', [])))
+          ")
+
+          INCLUDE_ONLY=$(python3 -c "
+          import yaml, json
+          with open('config.yml') as f:
+              cfg = yaml.safe_load(f)
+          print(json.dumps(cfg.get('include_only', [])))
+          ")
+
+          # Filter
+          FILTERED=$(python3 -c "
+          import json, sys
+          repos = json.loads('$REPOS')
+          exclude = json.loads('$EXCLUDE')
+          include_only = json.loads('$INCLUDE_ONLY')
+          single = '${{ github.event.inputs.single_repo }}'.strip()
+
+          if single:
+              repos = [single] if single in repos else []
+          elif include_only:
+              repos = [r for r in repos if r in include_only]
+          else:
+              repos = [r for r in repos if r not in exclude]
+
+          print(json.dumps(repos))
+          ")
+
+          echo "repos=$FILTERED" >> $GITHUB_OUTPUT
+          echo "\U0001f4cb Repos to review: $FILTERED" >> $GITHUB_STEP_SUMMARY
+
+  review:
+    name: "Review ${{ matrix.repo }}"
+    needs: discover
+    if: needs.discover.outputs.repos != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        repo: ${{ fromJson(needs.discover.outputs.repos) }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout hub (for scripts)
+        uses: actions/checkout@v4
+        with:
+          path: hub
+
+      - name: Clone target repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          OWNER=$(grep 'github_owner' hub/config.yml | awk '{print $2}' | tr -d '"')
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${{ matrix.repo }}.git" target
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install google-genai
+        run: pip install -q google-genai pyyaml
+
+      - name: Run AI review
+        id: review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          MODEL=$(python3 -c "
+          import yaml
+          with open('hub/config.yml') as f:
+              print(yaml.safe_load(f).get('gemini', {}).get('weekly_model', 'gemini-2.5-flash'))
+          ")
+
+          python hub/scripts/ai-review.py \
+            --mode full \
+            --project-dir target \
+            --model "$MODEL" \
+            --output review_report.md
+
+          echo "\u2705 Review completed for ${{ matrix.repo }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create issue in target repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          OWNER=$(grep 'github_owner' hub/config.yml | awk '{print $2}' | tr -d '"')
+          DATE=$(date +%Y-%m-%d)
+          REPORT=$(cat review_report.md)
+
+          # Close previous automated issues
+          gh issue list \
+            --repo "${OWNER}/${{ matrix.repo }}" \
+            --label "ai-code-review,automated" \
+            --state open \
+            --json number \
+            --jq '.[].number' | while read num; do
+              gh issue close "$num" --repo "${OWNER}/${{ matrix.repo }}" 2>/dev/null || true
+            done
+
+          # Create new issue
+          BODY=$(cat <<ISSUE_EOF
+          ${REPORT}
+
+          ---
+          *\U0001f916 Автоматически сгенерировано [code-review-hub](https://github.com/${OWNER}/code-review-hub) \u00b7 Gemini AI \u00b7 ${DATE}*
+          ISSUE_EOF
+          )
+
+          gh issue create \
+            --repo "${OWNER}/${{ matrix.repo }}" \
+            --title "[AI Review] Еженедельный отчёт \u2014 ${DATE}" \
+            --body "$BODY" \
+            --label "ai-code-review,automated" 2>/dev/null || \
+          gh issue create \
+            --repo "${OWNER}/${{ matrix.repo }}" \
+            --title "[AI Review] Еженедельный отчёт \u2014 ${DATE}" \
+            --body "$BODY"
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-${{ matrix.repo }}
+          path: review_report.md
+          retention-days: 30
+
+  notify:
+    name: "Send notifications"
+    needs: [discover, review]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout hub
+        uses: actions/checkout@v4
+
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+
+      - name: Build summary & send webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          OWNER=$(grep 'github_owner' config.yml | awk '{print $2}' | tr -d '"')
+          DATE=$(date +%Y-%m-%d)
+          REPOS='${{ needs.discover.outputs.repos }}'
+
+          # Build combined summary
+          SUMMARY="# \U0001f4ca Weekly AI Review Summary \u2014 ${DATE}\n\n"
+          SUMMARY+="**Repos reviewed:** $(echo "$REPOS" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')\n\n"
+
+          for dir in reports/review-*/; do
+            REPO_NAME=$(basename "$dir" | sed 's/review-//')
+            if [ -f "$dir/review_report.md" ]; then
+              SCORE=$(grep -oP 'Health Score:\s*\K[0-9.]+' "$dir/review_report.md" 2>/dev/null || echo "N/A")
+              SUMMARY+="- **${REPO_NAME}**: Health ${SCORE}/10\n"
+            fi
+          done
+
+          echo -e "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+          # Send webhook if configured
+          if [ -n "$WEBHOOK_URL" ]; then
+            PAYLOAD=$(jq -n \
+              --arg event "weekly_review_summary" \
+              --arg date "$DATE" \
+              --arg owner "$OWNER" \
+              --argjson repos "$REPOS" \
+              --arg summary "$(echo -e "$SUMMARY")" \
+              '{event:$event, date:$date, owner:$owner, repos:$repos, summary:$summary}')
+
+            curl -sf -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              --max-time 30 || echo "\u26a0\ufe0f Webhook delivery failed"
+          fi

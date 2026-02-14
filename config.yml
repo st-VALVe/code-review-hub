@@ -1,0 +1,38 @@
+# Code Review Hub — Central Configuration
+# ─────────────────────────────────────────
+# This file is read by the hub workflows to determine
+# which repos to review and how.
+
+github_owner: "st-VALVe"
+
+gemini:
+  model: "gemini-2.5-flash"
+  # For weekly full reviews, use the more capable model:
+  weekly_model: "gemini-2.5-flash"
+  # For PR reviews (speed matters more):
+  pr_model: "gemini-2.5-flash"
+
+schedule:
+  # Full AI review of all repos (cron)
+  weekly_review: "0 6 * * 0"      # Sunday 6:00 UTC
+  # Auto-sync PR workflows to repos (cron)
+  sync_workflows: "0 3 * * 1"     # Monday 3:00 UTC
+
+# Repos to EXCLUDE from review (exact names)
+exclude_repos:
+  - "code-review-hub"
+  - ".github"
+
+# If non-empty, ONLY these repos are reviewed (overrides exclude)
+include_only: []
+
+# Filters
+skip_forks: true
+skip_archived: true
+
+# Webhook — reports are POSTed here as JSON
+# Configure the actual URL in GitHub Secrets as WEBHOOK_URL
+webhook:
+  enabled: true
+  # Timeout in seconds for webhook delivery
+  timeout: 30
