@@ -41,6 +41,7 @@ schedule:
 exclude_repos:
   - "code-review-hub"
   - ".github"
+  - "OpenClaw"
 
 include_only: []
 
