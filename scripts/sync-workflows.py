@@ -67,10 +67,18 @@ def gh_api_pages(endpoint):
 
 
 def discover_repos(owner, config):
-    """List repos applying config filters."""
-    all_repos = gh_api_pages(f"/users/{owner}/repos?type=owner")
+    """List repos applying config filters. Uses /user/repos for private access."""
+    # /user/repos (authenticated) returns private repos too
+    all_repos = gh_api_pages(f"/user/repos?affiliation=owner")
+    if not all_repos:
+        # Fallback to public API
+        print("  ⚠ /user/repos returned nothing, falling back to /users/{owner}/repos", file=sys.stderr)
+        all_repos = gh_api_pages(f"/users/{owner}/repos?type=owner")
     names = []
     for r in all_repos:
+        # Filter by owner (affiliation=owner may include org repos)
+        if r.get("owner", {}).get("login", "").lower() != owner.lower():
+            continue
         if r.get("fork") and config.get("skip_forks", True):
             continue
         if r.get("archived") and config.get("skip_archived", True):
@@ -166,9 +174,9 @@ EMOJI = {
 }
 
 
-def sync_one(owner, repo, filename, content, force=False):
-    """Sync a single workflow file. Returns status string."""
-    path = f".github/workflows/{filename}"
+def sync_one(owner, repo, filename, content, force=False, full_path=None):
+    """Sync a single file. Returns status string."""
+    path = full_path or f".github/workflows/{filename}"
     sha, existing, is_managed = get_remote_file(owner, repo, path)
 
     if sha and not is_managed and not force:
@@ -285,6 +293,19 @@ def main():
                     s = sync_one(owner, repo, "code-quality.yml", tpl, force)
                 repo_results["code-quality"] = s
                 print(f"   {EMOJI.get(s, '?')} code-quality ({label}): {s}")
+
+        # 4) Webhook manifest (.github/code-review-hub.yml)
+        tpl = load_template(
+            templates_dir, "code-review-hub-config.yml", {"OWNER": owner}
+        )
+        if tpl:
+            if dry_run:
+                s = "dry-run"
+            else:
+                s = sync_one(owner, repo, "code-review-hub.yml", tpl, force,
+                             full_path=".github/code-review-hub.yml")
+            repo_results["manifest"] = s
+            print(f"   {EMOJI.get(s, '?')} manifest: {s}")
 
         results[repo] = repo_results
         print()
