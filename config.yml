@@ -1,56 +1,39 @@
 # Code Review Hub — Central Configuration
 # ─────────────────────────────────────────
+# This file is read by the hub workflows to determine
+# which repos to review and how.
 
 github_owner: "st-VALVe"
 
-# ┌─────────────────────────────────────────────┐
-# │  AI Provider                                  │
-# │  "gemini" = Google AI Studio (GEMINI_API_KEY) │
-# │  "claude" = Vertex AI (GCP auth)              │
-# └─────────────────────────────────────────────┘
-
-provider: "gemini"
-
-# Gemini models (via Google AI Studio API key)
 gemini:
+  model: "gemini-2.5-flash"
+  # For weekly full reviews, use the more capable model:
   weekly_model: "gemini-2.5-flash"
+  # For PR reviews (speed matters more):
   pr_model: "gemini-2.5-flash"
 
-# Claude models (via Google Vertex AI — same Google account)
-# Requires: GCP_PROJECT_ID secret + Workload Identity or SA key
-claude:
-  weekly_model: "claude-opus-4-6"
-  pr_model: "claude-sonnet-4-5"
-  gcp_region: "us-east5"
-
-# ┌─────────────────────────────────────────────┐
-# │  Activity filter                              │
-# └─────────────────────────────────────────────┘
-activity_days: 7
-
-# ┌─────────────────────────────────────────────┐
-# │  Schedule                                     │
-# └─────────────────────────────────────────────┘
 schedule:
+  # Full AI review of all repos (cron)
   weekly_review: "0 6 * * 0"      # Sunday 6:00 UTC
+  # Auto-sync PR workflows to repos (cron)
   sync_workflows: "0 3 * * 1"     # Monday 3:00 UTC
 
-# ┌─────────────────────────────────────────────┐
-# │  Repo filters                                 │
-# └─────────────────────────────────────────────┘
+# Repos to EXCLUDE from review (exact names)
 exclude_repos:
   - "code-review-hub"
   - ".github"
-  - "OpenClaw"
+  - "YOTTO-JS-bot"    # renamed to yotto-bot
 
+# If non-empty, ONLY these repos are reviewed (overrides exclude)
 include_only: []
 
+# Filters
 skip_forks: true
 skip_archived: true
 
-# ┌─────────────────────────────────────────────┐
-# │  Webhook                                      │
-# └─────────────────────────────────────────────┘
+# Webhook — reports are POSTed here as JSON
+# Configure the actual URL in GitHub Secrets as WEBHOOK_URL
 webhook:
   enabled: true
+  # Timeout in seconds for webhook delivery
   timeout: 30
