@@ -7,9 +7,14 @@ on:
   pull_request:
     branches: [main, master, develop]
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
-  lint:
-    name: Lint & Type Check
+  quality:
+    name: Code Quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,71 +23,189 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
+      - run: mkdir -p qr
+
+      # ── Checks ───────────────────────────────────────────
 
       - name: ESLint
+        id: lint
         run: |
           if jq -e '.scripts.lint' package.json > /dev/null 2>&1; then
-            npm run lint 2>&1 || echo "::warning::Lint issues found"
+            npm run lint > qr/lint.txt 2>&1; RC=$?
+            cat qr/lint.txt
+            echo "status=$RC" >> $GITHUB_OUTPUT
           else
-            echo "ℹ️ No lint script configured — skipping"
+            echo "ℹ️ No lint script configured" | tee qr/lint.txt
+            echo "status=skip" >> $GITHUB_OUTPUT
           fi
         continue-on-error: true
 
       - name: TypeScript Check
+        id: typecheck
         run: |
+          CMD=""
           if jq -e '.scripts.typecheck' package.json > /dev/null 2>&1; then
-            npm run typecheck 2>&1 || echo "::warning::Type errors found"
+            CMD="typecheck"
           elif jq -e '.scripts["type-check"]' package.json > /dev/null 2>&1; then
-            npm run type-check 2>&1 || echo "::warning::Type errors found"
+            CMD="type-check"
+          fi
+          if [ -n "$CMD" ]; then
+            npm run "$CMD" > qr/typecheck.txt 2>&1; RC=$?
+            cat qr/typecheck.txt
+            echo "status=$RC" >> $GITHUB_OUTPUT
           else
-            echo "ℹ️ No typecheck script configured — skipping"
+            echo "ℹ️ No typecheck script configured" | tee qr/typecheck.txt
+            echo "status=skip" >> $GITHUB_OUTPUT
           fi
         continue-on-error: true
 
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      - run: npm ci
-
-      - name: Run tests
+      - name: Tests
+        id: test
         run: |
           if jq -e '.scripts.test' package.json > /dev/null 2>&1; then
             TEST_CMD=$(jq -r '.scripts.test' package.json)
             if echo "$TEST_CMD" | grep -q "no test specified"; then
-              echo "ℹ️ No tests configured — skipping"
+              echo "ℹ️ No tests configured" | tee qr/test.txt
+              echo "status=skip" >> $GITHUB_OUTPUT
             else
-              npm test 2>&1 || echo "::warning::Some tests failed"
+              npm test > qr/test.txt 2>&1; RC=$?
+              cat qr/test.txt
+              echo "status=$RC" >> $GITHUB_OUTPUT
             fi
           else
-            echo "ℹ️ No test script found — skipping"
+            echo "ℹ️ No test script found" | tee qr/test.txt
+            echo "status=skip" >> $GITHUB_OUTPUT
           fi
         continue-on-error: true
         env:
           NODE_OPTIONS: --max-old-space-size=512
 
-  security:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      - run: npm ci
-
-      - name: npm audit
+      - name: Security Audit
+        id: security
         run: |
           AUDIT=$(npm audit --json 2>/dev/null || echo '{}')
           CRITICAL=$(echo "$AUDIT" | jq '.vulnerabilities // {} | to_entries | map(select(.value.severity == "critical")) | length' 2>/dev/null || echo 0)
-          echo "Critical vulnerabilities: $CRITICAL"
-          if [ "$CRITICAL" -gt 0 ]; then
-            echo "::error::Found $CRITICAL critical vulnerabilities"
-          fi
+          HIGH=$(echo "$AUDIT" | jq '.vulnerabilities // {} | to_entries | map(select(.value.severity == "high")) | length' 2>/dev/null || echo 0)
+          npm audit 2>&1 | head -80 > qr/security.txt || true
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH" >> $GITHUB_OUTPUT
+          if [ "$CRITICAL" -gt 0 ]; then echo "status=critical" >> $GITHUB_OUTPUT
+          elif [ "$HIGH" -gt 0 ]; then echo "status=high" >> $GITHUB_OUTPUT
+          else echo "status=ok" >> $GITHUB_OUTPUT; fi
         continue-on-error: true
+
+      # ── Report: PR Comment ──────────────────────────────
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const read = f => { try { return fs.readFileSync(`qr/${f}`, 'utf8').trim(); } catch { return 'N/A'; } };
+            const icon = s => s === 'skip' ? '⏭️' : s === '0' ? '✅' : s === 'ok' ? '✅' : '❌';
+            const secIcon = s => s === 'critical' ? '🚨' : s === 'high' ? '⚠️' : s === 'ok' ? '✅' : '⏭️';
+
+            const ls = '${{ steps.lint.outputs.status }}';
+            const ts = '${{ steps.typecheck.outputs.status }}';
+            const tt = '${{ steps.test.outputs.status }}';
+            const ss = '${{ steps.security.outputs.status }}';
+
+            const body = [
+              '## 🔍 Code Quality Report', '',
+              '| Check | Status |', '|-------|--------|',
+              `| ESLint | ${icon(ls)} |`,
+              `| TypeScript | ${icon(ts)} |`,
+              `| Tests | ${icon(tt)} |`,
+              `| Security | ${secIcon(ss)} |`, '',
+              '<details><summary>📋 ESLint</summary>', '',
+              '```', read('lint.txt').substring(0, 3000), '```', '</details>', '',
+              '<details><summary>📋 TypeScript</summary>', '',
+              '```', read('typecheck.txt').substring(0, 3000), '```', '</details>', '',
+              '<details><summary>📋 Tests</summary>', '',
+              '```', read('test.txt').substring(0, 3000), '```', '</details>', '',
+              '<details><summary>📋 Security</summary>', '',
+              '```', read('security.txt').substring(0, 3000), '```', '</details>', '',
+              '---',
+              `*🤖 [code-review-hub](https://github.com/${context.repo.owner}/code-review-hub) · \`${context.sha.substring(0,7)}\`*`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body?.includes('Code Quality Report') && c.body?.includes('code-review-hub'));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+            }
+
+      # ── Report: Webhook ─────────────────────────────────
+
+      - name: Send webhook
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          [ -z "$WEBHOOK_URL" ] && exit 0
+          jq -n \
+            --arg event "code_quality" \
+            --arg repo "${{ github.repository }}" \
+            --arg ref "${{ github.ref }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg lint "${{ steps.lint.outputs.status }}" \
+            --arg typecheck "${{ steps.typecheck.outputs.status }}" \
+            --arg test "${{ steps.test.outputs.status }}" \
+            --arg security "${{ steps.security.outputs.status }}" \
+            --arg critical "${{ steps.security.outputs.critical }}" \
+            --arg high "${{ steps.security.outputs.high }}" \
+            '{event:$event,repo:$repo,ref:$ref,sha:$sha,
+              results:{lint:$lint,typecheck:$typecheck,test:$test,
+              security:$security,critical_vulns:$critical,high_vulns:$high}}' |
+          curl -sf -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" -d @- --max-time 30 || echo "⚠️ Webhook failed"
+
+      # ── Report: Issue on critical problems ──────────────
+
+      - name: Create issue (critical on main)
+        if: |
+          always() && github.event_name == 'push' &&
+          (steps.security.outputs.status == 'critical' ||
+           (steps.lint.outputs.status != '0' && steps.lint.outputs.status != 'skip') ||
+           (steps.test.outputs.status  != '0' && steps.test.outputs.status  != 'skip'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          ico() { [ "$1" = "0" ] || [ "$1" = "ok" ] && echo "✅" || echo "❌"; }
+
+          BODY="## 🚨 Code Quality Issues Detected
+
+          **Branch:** \`${{ github.ref_name }}\`
+          **Commit:** [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+
+          | Check | Status |
+          |-------|--------|
+          | ESLint | $(ico ${{ steps.lint.outputs.status }}) |
+          | TypeScript | $(ico ${{ steps.typecheck.outputs.status }}) |
+          | Tests | $(ico ${{ steps.test.outputs.status }}) |
+          | Security | $(ico ${{ steps.security.outputs.status }}) |
+
+          [View full run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ---
+          *🤖 [code-review-hub](https://github.com/${{ github.repository_owner }}/code-review-hub)*"
+
+          # Close previous auto-issues
+          gh issue list --label "code-quality,automated" --state open --json number --jq '.[].number' 2>/dev/null | while read num; do
+            gh issue close "$num" 2>/dev/null || true
+          done
+
+          echo "$BODY" | gh issue create \
+            --title "[Code Quality] Проблемы — ${DATE}" \
+            --body-file - \
+            --label "code-quality,automated" 2>/dev/null || \
+          echo "$BODY" | gh issue create \
+            --title "[Code Quality] Проблемы — ${DATE}" \
+            --body-file -
