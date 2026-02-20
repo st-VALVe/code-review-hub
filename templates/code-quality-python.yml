@@ -1,0 +1,79 @@
+# managed-by: code-review-hub v2
+name: Code Quality Check
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -q ruff mypy 2>/dev/null || true
+          if [ -f requirements.txt ]; then pip install -q -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -q -e '.[dev]' 2>/dev/null || pip install -q -e . 2>/dev/null || true; fi
+
+      - name: Ruff lint
+        run: ruff check . 2>&1 || echo "::warning::Lint issues found"
+        continue-on-error: true
+
+      - name: Ruff format check
+        run: ruff format --check . 2>&1 || echo "::warning::Formatting issues found"
+        continue-on-error: true
+
+      - name: MyPy type check
+        run: mypy . --ignore-missing-imports 2>&1 || echo "::warning::Type issues found"
+        continue-on-error: true
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -q pytest 2>/dev/null || true
+          if [ -f requirements.txt ]; then pip install -q -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -q -e '.[dev]' 2>/dev/null || pip install -q -e . 2>/dev/null || true; fi
+
+      - name: Run tests
+        run: |
+          if find . -name 'test_*.py' -o -name '*_test.py' | head -1 | grep -q .; then
+            python -m pytest -v 2>&1 || echo "::warning::Some tests failed"
+          else
+            echo "ℹ️ No test files found — skipping"
+          fi
+        continue-on-error: true
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: pip audit
+        run: |
+          pip install -q pip-audit 2>/dev/null || true
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt 2>&1 || echo "::warning::Security issues found"
+          else
+            echo "ℹ️ No requirements.txt — skipping audit"
+          fi
+        continue-on-error: true

@@ -1,0 +1,88 @@
+# managed-by: code-review-hub v2
+name: Code Quality Check
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: ESLint
+        run: |
+          if jq -e '.scripts.lint' package.json > /dev/null 2>&1; then
+            npm run lint 2>&1 || echo "::warning::Lint issues found"
+          else
+            echo "ℹ️ No lint script configured — skipping"
+          fi
+        continue-on-error: true
+
+      - name: TypeScript Check
+        run: |
+          if jq -e '.scripts.typecheck' package.json > /dev/null 2>&1; then
+            npm run typecheck 2>&1 || echo "::warning::Type errors found"
+          elif jq -e '.scripts["type-check"]' package.json > /dev/null 2>&1; then
+            npm run type-check 2>&1 || echo "::warning::Type errors found"
+          else
+            echo "ℹ️ No typecheck script configured — skipping"
+          fi
+        continue-on-error: true
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Run tests
+        run: |
+          if jq -e '.scripts.test' package.json > /dev/null 2>&1; then
+            TEST_CMD=$(jq -r '.scripts.test' package.json)
+            if echo "$TEST_CMD" | grep -q "no test specified"; then
+              echo "ℹ️ No tests configured — skipping"
+            else
+              npm test 2>&1 || echo "::warning::Some tests failed"
+            fi
+          else
+            echo "ℹ️ No test script found — skipping"
+          fi
+        continue-on-error: true
+        env:
+          NODE_OPTIONS: --max-old-space-size=512
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: npm audit
+        run: |
+          AUDIT=$(npm audit --json 2>/dev/null || echo '{}')
+          CRITICAL=$(echo "$AUDIT" | jq '.vulnerabilities // {} | to_entries | map(select(.value.severity == "critical")) | length' 2>/dev/null || echo 0)
+          echo "Critical vulnerabilities: $CRITICAL"
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "::error::Found $CRITICAL critical vulnerabilities"
+          fi
+        continue-on-error: true

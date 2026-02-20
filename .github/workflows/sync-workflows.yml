@@ -1,4 +1,4 @@
-name: "Sync PR Workflows to All Repos"
+name: "Sync Quality Workflows to All Repos"
 
 on:
   schedule:
@@ -6,7 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run (list repos but don't create files)"
+        description: "Show what would happen without making changes"
+        type: boolean
+        default: false
+      force:
+        description: "Override non-managed workflows too"
         type: boolean
         default: false
 
@@ -18,107 +22,19 @@ jobs:
       - name: Checkout hub
         uses: actions/checkout@v4
 
-      - name: Discover & sync
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install -q pyyaml
+
+      - name: Sync quality workflows
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: |
-          set -e
-          OWNER=$(grep 'github_owner' config.yml | awk '{print $2}' | tr -d '"')
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
-
-          echo "## \U0001f504 Workflow Sync Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Read config
-          EXCLUDE=$(python3 -c "
-          import yaml, json
-          with open('config.yml') as f:
-              cfg = yaml.safe_load(f)
-          print(json.dumps(cfg.get('exclude_repos', [])))
-          ")
-
-          INCLUDE_ONLY=$(python3 -c "
-          import yaml, json
-          with open('config.yml') as f:
-              cfg = yaml.safe_load(f)
-          print(json.dumps(cfg.get('include_only', [])))
-          ")
-
-          # Get all repos
-          REPOS=$(gh api --paginate "/users/${OWNER}/repos?per_page=100&type=owner" \
-            --jq '[.[] | select(.fork == false and .archived == false) | .name]')
-
-          FILTERED=$(python3 -c "
-          import json
-          repos = json.loads('$REPOS')
-          exclude = json.loads('$EXCLUDE')
-          include_only = json.loads('$INCLUDE_ONLY')
-          if include_only:
-              repos = [r for r in repos if r in include_only]
-          else:
-              repos = [r for r in repos if r not in exclude]
-          for r in repos:
-              print(r)
-          ")
-
-          # The caller workflow to provision
-          CALLER_CONTENT=$(cat <<'WORKFLOW_EOF'
-          name: AI PR Review
-
-          on:
-            pull_request:
-              types: [opened, synchronize, reopened]
-
-          jobs:
-            review:
-              uses: OWNER_PLACEHOLDER/code-review-hub/.github/workflows/reusable-pr-review.yml@main
-              secrets:
-                GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          WORKFLOW_EOF
-          )
-          # Remove leading whitespace from heredoc and replace placeholder
-          CALLER_CONTENT=$(echo "$CALLER_CONTENT" | sed 's/^          //;s/OWNER_PLACEHOLDER/'"${OWNER}"'/')
-
-          SYNCED=0
-          SKIPPED=0
-          NEW_REPOS=""
-
-          for REPO in $FILTERED; do
-            EXISTS=$(gh api "/repos/${OWNER}/${REPO}/contents/.github/workflows/ai-pr-review.yml" \
-              --jq '.sha' 2>/dev/null || echo "")
-
-            if [ -n "$EXISTS" ]; then
-              echo "- \u2705 **${REPO}** \u2014 already has PR workflow" >> $GITHUB_STEP_SUMMARY
-              SKIPPED=$((SKIPPED + 1))
-            else
-              if [ "$DRY_RUN" = "true" ]; then
-                echo "- \U0001f195 **${REPO}** \u2014 WOULD create PR workflow (dry run)" >> $GITHUB_STEP_SUMMARY
-              else
-                ENCODED=$(echo "$CALLER_CONTENT" | base64 -w 0)
-                gh api -X PUT "/repos/${OWNER}/${REPO}/contents/.github/workflows/ai-pr-review.yml" \
-                  -f message="\U0001f916 Add AI PR Review workflow (auto-provisioned by code-review-hub)" \
-                  -f content="$ENCODED" \
-                  --silent 2>/dev/null && \
-                  echo "- \U0001f195 **${REPO}** \u2014 PR workflow created!" >> $GITHUB_STEP_SUMMARY || \
-                  echo "- \u274c **${REPO}** \u2014 Failed to create workflow" >> $GITHUB_STEP_SUMMARY
-              fi
-              SYNCED=$((SYNCED + 1))
-              NEW_REPOS="${NEW_REPOS} ${REPO}"
-            fi
-          done
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Total:** ${SKIPPED} already synced, ${SYNCED} newly provisioned" >> $GITHUB_STEP_SUMMARY
-
-          # Webhook about new repos discovered
-          if [ -n "$NEW_REPOS" ] && [ -n "${WEBHOOK_URL}" ]; then
-            PAYLOAD=$(jq -n \
-              --arg event "new_repos_synced" \
-              --arg repos "${NEW_REPOS}" \
-              --argjson count "$SYNCED" \
-              '{event:$event, new_repos:$repos, count:$count}')
-            curl -sf -X POST "$WEBHOOK_URL" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" --max-time 30 || true
-          fi
+          HUB_DIR: "."
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          FORCE_MANAGE: ${{ github.event.inputs.force || 'false' }}
+        run: python scripts/sync-workflows.py

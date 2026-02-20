@@ -31,6 +31,18 @@ include_only: []
 skip_forks: true
 skip_archived: true
 
+# Quality workflow provisioning
+# The sync script auto-discovers repos, detects project type,
+# and provisions appropriate workflows.
+quality_workflows:
+  enabled: true
+  pr_review: true       # AI PR review via reusable workflow
+  codeql: true          # CodeQL security analysis
+  code_quality: true    # Lint, typecheck, tests, security audit
+  # Set to true to take over manually-created workflows
+  # (by default, only workflows with the managed-by marker are updated)
+  force_manage: false
+
 # Webhook — reports are POSTed here as JSON
 # Configure the actual URL in GitHub Secrets as WEBHOOK_URL
 webhook:
