@@ -436,7 +436,7 @@ def main():
 
     model = args.model
     if not model:
-        model = "gemini-2.5-flash" if args.provider == "gemini" else "claude-opus-4-6"
+        model = "gemini-3.1-pro" if args.provider == "gemini" else "claude-opus-4-6"
 
     extra = dict(api_key=args.api_key, gcp_project=args.gcp_project, gcp_region=args.gcp_region)
 

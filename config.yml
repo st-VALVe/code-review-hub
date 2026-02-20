@@ -6,11 +6,11 @@
 github_owner: "st-VALVe"
 
 gemini:
-  model: "gemini-2.5-flash"
-  # For weekly full reviews, use the more capable model:
-  weekly_model: "gemini-2.5-flash"
-  # For PR reviews (speed matters more):
-  pr_model: "gemini-2.5-flash"
+  model: "gemini-3.1-pro"
+  # For weekly full reviews:
+  weekly_model: "gemini-3.1-pro"
+  # For PR reviews:
+  pr_model: "gemini-3.1-pro"
 
 schedule:
   # Full AI review of all repos (cron)
