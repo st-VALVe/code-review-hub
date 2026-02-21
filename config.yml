@@ -37,7 +37,7 @@ skip_archived: true
 quality_workflows:
   enabled: true
   pr_review: true       # AI PR review via reusable workflow
-  codeql: true          # CodeQL security analysis
+  codeql: false          # CodeQL security analysis
   code_quality: true    # Lint, typecheck, tests, security audit
   # Set to true to take over manually-created workflows
   # (by default, only workflows with the managed-by marker are updated)
