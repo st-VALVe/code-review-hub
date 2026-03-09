@@ -23,6 +23,13 @@ exclude_repos:
   - "code-review-hub"
   - ".github"
   - "YOTTO-JS-bot"    # renamed to yotto-bot
+  # Inactive repositories — no code changes expected
+  - "UnityPCWaterShader"
+  - "UnityPortalVFX"
+  - "UnitySparklingShader"
+  - "smartDeNoise_OBS"
+  - "AimDev"
+  - "AimDevBuild"
 
 # If non-empty, ONLY these repos are reviewed (overrides exclude)
 include_only: []
