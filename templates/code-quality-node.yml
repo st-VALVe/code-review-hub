@@ -12,6 +12,10 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: code-quality-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   quality:
     name: Code Quality
@@ -30,13 +34,13 @@ jobs:
       - name: ESLint
         id: lint
         run: |
-          if jq -e '.scripts.lint' package.json > /dev/null 2>&1; then
-            npm run lint > qr/lint.txt 2>&1; RC=$?
+          if jq -e '.scripts.lint | type == "string" and length > 0' package.json > /dev/null 2>&1; then
+            if npm run lint > qr/lint.txt 2>&1; then RC=0; else RC=$?; fi
             cat qr/lint.txt
-            echo "status=$RC" >> $GITHUB_OUTPUT
+            printf 'status=%s\n' "$RC" >> "$GITHUB_OUTPUT"
           else
             echo "ℹ️ No lint script configured" | tee qr/lint.txt
-            echo "status=skip" >> $GITHUB_OUTPUT
+            echo "status=skip" >> "$GITHUB_OUTPUT"
           fi
         continue-on-error: true
 
@@ -44,37 +48,39 @@ jobs:
         id: typecheck
         run: |
           CMD=""
-          if jq -e '.scripts.typecheck' package.json > /dev/null 2>&1; then
+          if jq -e '.scripts.typecheck | type == "string" and length > 0' package.json > /dev/null 2>&1; then
             CMD="typecheck"
-          elif jq -e '.scripts["type-check"]' package.json > /dev/null 2>&1; then
+          elif jq -e '.scripts["type-check"] | type == "string" and length > 0' package.json > /dev/null 2>&1; then
             CMD="type-check"
+          elif jq -e '.scripts["typecheck:local"] | type == "string" and length > 0' package.json > /dev/null 2>&1; then
+            CMD="typecheck:local"
           fi
           if [ -n "$CMD" ]; then
-            npm run "$CMD" > qr/typecheck.txt 2>&1; RC=$?
+            if npm run "$CMD" > qr/typecheck.txt 2>&1; then RC=0; else RC=$?; fi
             cat qr/typecheck.txt
-            echo "status=$RC" >> $GITHUB_OUTPUT
+            printf 'status=%s\n' "$RC" >> "$GITHUB_OUTPUT"
           else
             echo "ℹ️ No typecheck script configured" | tee qr/typecheck.txt
-            echo "status=skip" >> $GITHUB_OUTPUT
+            echo "status=skip" >> "$GITHUB_OUTPUT"
           fi
         continue-on-error: true
 
       - name: Tests
         id: test
         run: |
-          if jq -e '.scripts.test' package.json > /dev/null 2>&1; then
+          if jq -e '.scripts.test | type == "string" and length > 0' package.json > /dev/null 2>&1; then
             TEST_CMD=$(jq -r '.scripts.test' package.json)
             if echo "$TEST_CMD" | grep -q "no test specified"; then
               echo "ℹ️ No tests configured" | tee qr/test.txt
-              echo "status=skip" >> $GITHUB_OUTPUT
+              echo "status=skip" >> "$GITHUB_OUTPUT"
             else
-              npm test > qr/test.txt 2>&1; RC=$?
+              if npm test > qr/test.txt 2>&1; then RC=0; else RC=$?; fi
               cat qr/test.txt
-              echo "status=$RC" >> $GITHUB_OUTPUT
+              printf 'status=%s\n' "$RC" >> "$GITHUB_OUTPUT"
             fi
           else
             echo "ℹ️ No test script found" | tee qr/test.txt
-            echo "status=skip" >> $GITHUB_OUTPUT
+            echo "status=skip" >> "$GITHUB_OUTPUT"
           fi
         continue-on-error: true
         env:
@@ -83,15 +89,34 @@ jobs:
       - name: Security Audit
         id: security
         run: |
-          AUDIT=$(npm audit --json 2>/dev/null || echo '{}')
-          CRITICAL=$(echo "$AUDIT" | jq '.vulnerabilities // {} | to_entries | map(select(.value.severity == "critical")) | length' 2>/dev/null || echo 0)
-          HIGH=$(echo "$AUDIT" | jq '.vulnerabilities // {} | to_entries | map(select(.value.severity == "high")) | length' 2>/dev/null || echo 0)
-          npm audit 2>&1 | head -80 > qr/security.txt || true
-          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
-          echo "high=$HIGH" >> $GITHUB_OUTPUT
-          if [ "$CRITICAL" -gt 0 ]; then echo "status=critical" >> $GITHUB_OUTPUT
-          elif [ "$HIGH" -gt 0 ]; then echo "status=high" >> $GITHUB_OUTPUT
-          else echo "status=ok" >> $GITHUB_OUTPUT; fi
+          if npm audit --json > qr/security.json 2> qr/security.err; then AUDIT_RC=0; else AUDIT_RC=$?; fi
+          if [ -s qr/security.json ]; then cp qr/security.json qr/security.txt; else cp qr/security.err qr/security.txt; fi
+
+          CRITICAL=0
+          HIGH=0
+          STATUS=error
+          if jq -e --argjson audit_rc "$AUDIT_RC" \
+            'type == "object" and (.error == null) and
+             (.vulnerabilities | type == "object") and
+             ($audit_rc == 0 or (.vulnerabilities | length > 0))' \
+            qr/security.json > /dev/null 2>&1; then
+            if COUNTS=$(jq -r \
+              '[([.vulnerabilities[] | select(.severity == "critical")] | length),
+                ([.vulnerabilities[] | select(.severity == "high")] | length)] | @tsv' \
+              qr/security.json 2>/dev/null); then
+              IFS=$'\t' read -r CRITICAL HIGH <<< "$COUNTS"
+              if [[ "$CRITICAL" =~ ^[0-9]+$ && "$HIGH" =~ ^[0-9]+$ ]]; then
+                if [ "$CRITICAL" -gt 0 ]; then STATUS=critical
+                elif [ "$HIGH" -gt 0 ]; then STATUS=high
+                else STATUS=ok
+                fi
+              else
+                CRITICAL=0
+                HIGH=0
+              fi
+            fi
+          fi
+          printf 'critical=%s\nhigh=%s\nstatus=%s\n' "$CRITICAL" "$HIGH" "$STATUS" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
       # ── Report: PR Comment ──────────────────────────────
@@ -104,7 +129,7 @@ jobs:
             const fs = require('fs');
             const read = f => { try { return fs.readFileSync(`qr/${f}`, 'utf8').trim(); } catch { return 'N/A'; } };
             const icon = s => s === 'skip' ? '⏭️' : s === '0' ? '✅' : s === 'ok' ? '✅' : '❌';
-            const secIcon = s => s === 'critical' ? '🚨' : s === 'high' ? '⚠️' : s === 'ok' ? '✅' : '⏭️';
+            const secIcon = s => s === 'critical' ? '🚨' : s === 'high' ? '⚠️' : s === 'ok' ? '✅' : s === 'skip' ? '⏭️' : '❌';
 
             const ls = '${{ steps.lint.outputs.status }}';
             const ts = '${{ steps.typecheck.outputs.status }}';
@@ -113,11 +138,12 @@ jobs:
 
             const body = [
               '## 🔍 Code Quality Report', '',
+              'Policy: required failures block after evidence; advisory findings remain visible; skip means not configured; error is required.', '',
               '| Check | Status |', '|-------|--------|',
-              `| ESLint | ${icon(ls)} |`,
-              `| TypeScript | ${icon(ts)} |`,
-              `| Tests | ${icon(tt)} |`,
-              `| Security | ${secIcon(ss)} |`, '',
+              `| ESLint (advisory) | ${icon(ls)} |`,
+              `| TypeScript (required) | ${icon(ts)} |`,
+              `| Tests (required) | ${icon(tt)} |`,
+              `| Security critical/error (required); high (advisory) | ${secIcon(ss)} |`, '',
               '<details><summary>📋 ESLint</summary>', '',
               '```', read('lint.txt').substring(0, 3000), '```', '</details>', '',
               '<details><summary>📋 TypeScript</summary>', '',
@@ -130,9 +156,10 @@ jobs:
               `*🤖 [code-review-hub](https://github.com/${context.repo.owner}/code-review-hub) · \`${context.sha.substring(0,7)}\`*`,
             ].join('\n');
 
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
+              per_page: 100,
             });
             const existing = comments.find(c => c.body?.includes('Code Quality Report') && c.body?.includes('code-review-hub'));
             if (existing) {
@@ -172,7 +199,9 @@ jobs:
         if: |
           always() && github.event_name == 'push' &&
           (steps.security.outputs.status == 'critical' ||
+           steps.security.outputs.status == 'error' ||
            (steps.lint.outputs.status != '0' && steps.lint.outputs.status != 'skip') ||
+           (steps.typecheck.outputs.status != '0' && steps.typecheck.outputs.status != 'skip') ||
            (steps.test.outputs.status  != '0' && steps.test.outputs.status  != 'skip'))
         env:
           GH_TOKEN: ${{ github.token }}
@@ -197,9 +226,10 @@ jobs:
           ---
           *🤖 [code-review-hub](https://github.com/${{ github.repository_owner }}/code-review-hub)*"
 
+          set -o pipefail
           # Close previous auto-issues
-          gh issue list --label "code-quality,automated" --state open --json number --jq '.[].number' 2>/dev/null | while read num; do
-            gh issue close "$num" 2>/dev/null || true
+          gh issue list --state open --search '"[Code Quality]" in:title "code-review-hub" in:body' --json number --jq '.[].number' 2>/dev/null | while read num; do
+            gh issue close "$num" 2>/dev/null
           done
 
           echo "$BODY" | gh issue create \
@@ -209,3 +239,18 @@ jobs:
           echo "$BODY" | gh issue create \
             --title "[Code Quality] Проблемы — ${DATE}" \
             --body-file -
+
+      - name: Enforce required quality gate
+        if: always()
+        env:
+          TYPECHECK_STATUS: ${{ steps.typecheck.outputs.status }}
+          TEST_STATUS: ${{ steps.test.outputs.status }}
+          SECURITY_STATUS: ${{ steps.security.outputs.status }}
+          SECURITY_CRITICAL: ${{ steps.security.outputs.critical }}
+        run: |
+          FAILED=0
+          case "$TYPECHECK_STATUS" in 0|skip) ;; *) echo "TypeScript required check failed: $TYPECHECK_STATUS"; FAILED=1 ;; esac
+          case "$TEST_STATUS" in 0|skip) ;; *) echo "Tests required check failed: $TEST_STATUS"; FAILED=1 ;; esac
+          case "$SECURITY_STATUS" in ok|high) ;; *) echo "Security required check failed: $SECURITY_STATUS"; FAILED=1 ;; esac
+          case "$SECURITY_CRITICAL" in 0) ;; *) echo "Critical vulnerabilities: $SECURITY_CRITICAL"; FAILED=1 ;; esac
+          exit "$FAILED"
