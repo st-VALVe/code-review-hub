@@ -235,20 +235,7 @@ def main():
         type_str = ", ".join(types) if types else "generic"
         print(f"   Types: {type_str}")
 
-        # 1) AI PR Review
-        if qc.get("pr_review", True):
-            tpl = load_template(
-                templates_dir, "ai-pr-review.yml", {"OWNER": owner}
-            )
-            if tpl:
-                if dry_run:
-                    s = "dry-run"
-                else:
-                    s = sync_one(owner, repo, "ai-pr-review.yml", tpl, force)
-                repo_results["ai-pr-review"] = s
-                print(f"   {EMOJI.get(s, '?')} ai-pr-review: {s}")
-
-        # 2) CodeQL
+        # 1) CodeQL
         if qc.get("codeql", True):
             langs = []
             if "node" in types:
@@ -272,7 +259,7 @@ def main():
                 repo_results["codeql"] = s
                 print(f"   {EMOJI.get(s, '?')} codeql: {s}")
 
-        # 3) Code Quality
+        # 2) Code Quality
         if qc.get("code_quality", True):
             if "node" in types:
                 tpl = load_template(templates_dir, "code-quality-node.yml")
@@ -336,7 +323,6 @@ def main():
             f.write("| Repo | PR Review | CodeQL | Quality |\n")
             f.write("|------|-----------|--------|---------|\n")
             for repo, actions in results.items():
-                pr = EMOJI.get(actions.get("ai-pr-review", "—"), "—")
                 cq = EMOJI.get(actions.get("codeql", "—"), "—")
                 qu = EMOJI.get(actions.get("code-quality", "—"), "—")
                 f.write(f"| {repo} | {pr} | {cq} | {qu} |\n")

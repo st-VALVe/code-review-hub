@@ -5,13 +5,6 @@
 
 github_owner: "st-VALVe"
 
-gemini:
-  model: "gemini-3.1-pro"
-  # For weekly full reviews:
-  weekly_model: "gemini-3.1-pro"
-  # For PR reviews:
-  pr_model: "gemini-3.1-pro"
-
 schedule:
   # Full AI review of all repos (cron)
   weekly_review: "0 6 * * 0"      # Sunday 6:00 UTC
@@ -43,7 +36,6 @@ skip_archived: true
 # and provisions appropriate workflows.
 quality_workflows:
   enabled: true
-  pr_review: true       # AI PR review via reusable workflow
   codeql: false          # CodeQL security analysis
   code_quality: true    # Lint, typecheck, tests, security audit
   # Set to true to take over manually-created workflows

@@ -5,7 +5,6 @@
 ## Возможности
 
 - **🔍 Еженедельный полный AI-ревью** всех репозиториев (SOLID, безопасность, рефакторинг, тесты)
-- **📝 PR-ревью** каждого pull request через Gemini AI
 - **🔄 Авто-обнаружение** новых репозиториев
 - **📤 Webhook уведомления** на любой endpoint
 - **⚡ Context caching** для экономии на API-вызовах
@@ -26,16 +25,9 @@ gh repo create code-review-hub --public --source . --push
 | Secret | Описание | Как получить |
 |--------|----------|-------------|
 | `GH_PAT` | GitHub Personal Access Token с правами `repo` + `workflow` | [Создать токен](https://github.com/settings/tokens/new?scopes=repo,workflow) |
-| `GEMINI_API_KEY` | API-ключ Google Gemini | [Google AI Studio](https://aistudio.google.com/apikey) |
 | `WEBHOOK_URL` | *(опционально)* URL для получения отчётов | Ваш webhook endpoint |
 
-### 3. Добавить `GEMINI_API_KEY` в каждый репозиторий
-
-Для PR-ревью через reusable workflows нужен секрет `GEMINI_API_KEY` в каждом репо.
-
-> **Совет:** Если у вас GitHub Organization — добавьте `GEMINI_API_KEY` как organization secret с доступом ко всем репо.
-
-### 4. Запустить вручную
+### 3. Запустить вручную
 
 В Actions → "Weekly AI Review — All Repos" → Run workflow
 
@@ -46,27 +38,7 @@ gh repo create code-review-hub --public --source . --push
 ### Автоматически (рекомендуется)
 
 1. Просто создайте репозиторий — hub обнаружит его при следующем запуске `sync-workflows`
-2. Добавьте секрет `GEMINI_API_KEY` в новый репозиторий
-3. Готово! Еженедельный ревью включится автоматически, PR-ревью — после синхронизации
-
-### Вручную (для немедленного подключения)
-
-1. Добавьте секрет `GEMINI_API_KEY` в новый репозиторий
-
-2. Создайте файл `.github/workflows/ai-pr-review.yml`:
-```yaml
-name: AI PR Review
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-jobs:
-  review:
-    uses: st-VALVe/code-review-hub/.github/workflows/reusable-pr-review.yml@main
-    secrets:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-```
-
-3. Запустите `sync-workflows` вручную или дождитесь понедельника
+2. Готово! Workflows качества кода появятся после синхронизации
 
 ### Исключить репозиторий
 
@@ -85,11 +57,9 @@ exclude_repos:
 code-review-hub/
 ├── config.yml                              # Настройки (модели, расписание, исключения)
 ├── scripts/
-│   └── ai-review.py                        # Скрипт AI-анализа (Gemini API)
 └── .github/workflows/
     ├── weekly-review-all.yml               # Еженедельный ревью ВСЕХ репо
-    ├── sync-workflows.yml                  # Авто-раскатка PR workflow в репо
-    └── reusable-pr-review.yml              # Reusable workflow для PR-ревью
+    └── sync-workflows.yml                  # Авто-раскатка workflows качества кода в репо
 ```
 
 ## Workflows
@@ -98,7 +68,6 @@ code-review-hub/
 |----------|---------|-----------|
 | `weekly-review-all` | Воскресенье 6:00 UTC / manual | Клонирует каждый репо → AI-ревью → GitHub Issue + webhook |
 | `sync-workflows` | Понедельник 3:00 UTC / manual | Находит репо без PR workflow → создаёт его через API |
-| `reusable-pr-review` | Вызывается из каждого репо | Анализирует diff PR → комментарий в PR |
 
 ## Webhook
 
@@ -130,10 +99,6 @@ code-review-hub/
 
 ```yaml
 github_owner: "st-VALVe"          # Ваш GitHub username
-
-gemini:
-  weekly_model: "gemini-2.5-flash" # Модель для weekly review
-  pr_model: "gemini-2.5-flash"     # Модель для PR review
 
 exclude_repos:                     # Исключить из ревью
   - "code-review-hub"
