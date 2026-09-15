@@ -21,7 +21,6 @@ webhook:
 
 # Active quality workflows in this repo
 workflows:
-  ai_pr_review: true       # AI review on every PR (Gemini 3.1 Pro)
   codeql_analysis: true    # CodeQL security scanning
   code_quality: true       # lint, typecheck, tests, security audit
 
